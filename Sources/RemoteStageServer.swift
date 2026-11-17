@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 import os
 
@@ -9,13 +10,17 @@ import os
 /// thread, layers and caches: a proxy node asks for this device's memory on a connection of
 /// its own while its runner's is busy.
 enum RemoteStageServer {
-    static let protocolVersion = 3
+    static let protocolVersion = 4
 
     /// protocol.py's Frame: every field, snake_case on the wire
     struct Frame: Codable {
         var operation: String
         var handle = 0
         var source = 0
+        var sources: [Int] = []
+        var rows: [Int] = []
+        var leftPadding: [Int] = []
+        var rightPadding: [Int] = []
         var offset = 0
         var shape: [Int] = []
         var dtype = ""
@@ -24,6 +29,7 @@ enum RemoteStageServer {
         var deviceModel = ""
         var memoryTotal = 0
         var memoryAvailable = 0
+        var gpuWorkingSet = 0
         var configJson = ""
         var layerCount = 0
         var kvBytesPerToken = 0
@@ -32,6 +38,12 @@ enum RemoteStageServer {
     }
 
     struct ConnectionClosed: Error {}
+
+    /// What a handle names: one sequence's caches, or a batch's, one per layer
+    enum Caches {
+        case single([LlamaShard.KVCache])
+        case batch([LlamaShard.BatchKVCache])
+    }
 
     /// Serve nodes on `port`, each connection on its own thread. A node sends the layers it
     /// wants run in `load` frames.
@@ -81,12 +93,29 @@ enum RemoteStageServer {
         }
     }
 
+    /// This app's memory footprint: what iPadOS counts against its limit
+    static func footprint() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? Int(info.phys_footprint) : 0
+    }
+
     static func welcome() -> Frame {
-        Frame(
+        let physical = Int(ProcessInfo.processInfo.physicalMemory)
+        return Frame(
             operation: "welcome", protocolVersion: protocolVersion, deviceModel: deviceModel(),
-            memoryTotal: Int(ProcessInfo.processInfo.physicalMemory),
-            // What this app can still allocate before iPadOS ends it: the memory a model may use
-            memoryAvailable: Int(os_proc_available_memory()))
+            memoryTotal: physical,
+            // What this app can still allocate before iPadOS ends it. With the increased memory
+            // limit that allowance can exceed the RAM (it counts compressed memory), so never
+            // more than the RAM this app doesn't use yet
+            memoryAvailable: min(Int(os_proc_available_memory()), physical - footprint()),
+            // The most Metal says the GPU should use, as exo reads it on a Mac
+            gpuWorkingSet: Int(MTLCreateSystemDefaultDevice()?.recommendedMaxWorkingSetSize ?? 0))
     }
 
     /// Serves one node until it disconnects. Returns the forwards run and the caches dropped.
@@ -104,7 +133,12 @@ enum RemoteStageServer {
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
-        var caches: [Int: [LlamaShard.KVCache]] = [:]
+        var caches: [Int: Caches] = [:]
+
+        func batch(_ handle: Int) -> [LlamaShard.BatchKVCache] {
+            guard case .batch(let layers) = caches[handle] else { return [] }
+            return layers
+        }
         var forwards = 0
 
         func send(_ frame: Frame, _ payload: Data = Data()) throws {
@@ -162,7 +196,7 @@ enum RemoteStageServer {
                         kvBytesPerToken: layers.isEmpty ? 0 : kvBytesPerToken))
                 case "new":
                     if !layers.isEmpty {
-                        caches[frame.handle] = Array(repeating: LlamaShard.KVCache(), count: layers.count)
+                        caches[frame.handle] = .single(Array(repeating: LlamaShard.KVCache(), count: layers.count))
                     }
                 case "copy":
                     // MLX arrays never change in place, so a copy shares them
@@ -170,26 +204,94 @@ enum RemoteStageServer {
                 case "free":
                     caches[frame.handle] = nil
                 case "truncate":
-                    caches[frame.handle] = caches[frame.handle]?.map { $0.truncated(to: frame.offset) }
+                    if case .single(let layerCaches) = caches[frame.handle] {
+                        caches[frame.handle] = .single(layerCaches.map { $0.truncated(to: frame.offset) })
+                    }
+                case "merge":
+                    let sequences = frame.sources.compactMap { source -> [LlamaShard.KVCache]? in
+                        guard case .single(let layerCaches) = caches[source] else { return nil }
+                        return layerCaches
+                    }
+                    caches[frame.handle] = .batch(layers.indices.map { layer in
+                        LlamaShard.BatchKVCache.merge(sequences.map { $0[layer] })
+                    })
+                case "extend":
+                    let other = batch(frame.source)
+                    caches[frame.handle] = .batch(zip(batch(frame.handle), other).map {
+                        var cache = $0
+                        cache.extend($1)
+                        return cache
+                    })
+                case "filter":
+                    caches[frame.handle] = .batch(batch(frame.handle).map {
+                        var cache = $0
+                        cache.filter(frame.rows)
+                        return cache
+                    })
+                case "extract":
+                    caches[frame.handle] = .single(batch(frame.source).map { $0.extract(frame.rows[0]) })
+                case "prepare":
+                    caches[frame.handle] = .batch(batch(frame.handle).map {
+                        var cache = $0
+                        cache.prepare(leftPadding: frame.leftPadding, rightPadding: frame.rightPadding)
+                        return cache
+                    })
+                case "finalize":
+                    caches[frame.handle] = .batch(batch(frame.handle).map {
+                        var cache = $0
+                        cache.finalize()
+                        return cache
+                    })
+                case "trim":
+                    switch caches[frame.handle] {
+                    case .single(let layerCaches):
+                        caches[frame.handle] = .single(layerCaches.map {
+                            $0.truncated(to: max(0, $0.offset - frame.offset))
+                        })
+                    case .batch(let layerCaches):
+                        caches[frame.handle] = .batch(layerCaches.map {
+                            var cache = $0
+                            cache.trim(frame.offset)
+                            return cache
+                        })
+                    case nil:
+                        break
+                    }
                 case "stats":
-                    try send(Frame(operation: "counted", liveCaches: caches.count))
+                    let device = welcome()
+                    try send(Frame(
+                        operation: "counted", memoryTotal: device.memoryTotal,
+                        memoryAvailable: device.memoryAvailable, liveCaches: caches.count))
                 case "forward":
-                    guard var layerCaches = caches[frame.handle], let dtype = dtype(named: frame.dtype) else {
+                    guard let entry = caches[frame.handle], let dtype = dtype(named: frame.dtype) else {
                         try send(Frame(
                             operation: "error",
                             message: "no cache \(frame.handle) or dtype \(frame.dtype) on the stage"))
                         continue
                     }
                     var hidden = MLXArray(payload, frame.shape, dtype: dtype)
-                    for index in layers.indices {
-                        hidden = LlamaShard.forward(
-                            hidden, layer: layers[index], cache: &layerCaches[index],
-                            ropeFrequencies: ropeFrequencies)
+                    switch entry {
+                    case .single(var layerCaches):
+                        for index in layers.indices {
+                            hidden = LlamaShard.forward(
+                                hidden, layer: layers[index], cache: &layerCaches[index],
+                                ropeFrequencies: ropeFrequencies)
+                        }
+                        hidden = hidden.asType(dtype)
+                        eval(hidden)
+                        eval(layerCaches.flatMap { [$0.keys, $0.values].compactMap { $0 } })
+                        caches[frame.handle] = .single(layerCaches)
+                    case .batch(var layerCaches):
+                        for index in layers.indices {
+                            hidden = LlamaShard.forward(
+                                hidden, layer: layers[index], cache: &layerCaches[index],
+                                ropeFrequencies: ropeFrequencies)
+                        }
+                        hidden = hidden.asType(dtype)
+                        eval(hidden)
+                        eval(layerCaches.flatMap { [$0.keys, $0.values].compactMap { $0 } })
+                        caches[frame.handle] = .batch(layerCaches)
                     }
-                    hidden = hidden.asType(dtype)
-                    eval(hidden)
-                    eval(layerCaches.flatMap { [$0.keys, $0.values].compactMap { $0 } })
-                    caches[frame.handle] = layerCaches
                     let data = hidden.asData(access: .copy).data
                     try send(
                         Frame(

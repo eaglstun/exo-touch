@@ -49,7 +49,15 @@ enum LlamaShard {
         }
     }
 
-    struct KVCache {
+    /// A layer's cache, as attention uses it: where RoPE starts, the mask, and the keys and
+    /// values to attend over once this step's are added
+    protocol LayerCache {
+        func rope(_ x: MLXArray, headDim: Int, freqs: MLXArray) -> MLXArray
+        func mask(_ length: Int) -> MLXFast.ScaledDotProductAttentionMaskMode
+        mutating func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)
+    }
+
+    struct KVCache: LayerCache {
         var keys: MLXArray?
         var values: MLXArray?
 
@@ -61,6 +69,195 @@ enum LlamaShard {
             guard let keys, let values, offset < self.offset else { return self }
             if offset == 0 { return KVCache() }
             return KVCache(keys: keys[.ellipsis, ..<offset, 0...], values: values[.ellipsis, ..<offset, 0...])
+        }
+
+        func rope(_ x: MLXArray, headDim: Int, freqs: MLXArray) -> MLXArray {
+            MLXFast.RoPE(
+                x, dimensions: headDim, traditional: false, base: nil, scale: 1, offset: offset,
+                freqs: freqs)
+        }
+
+        func mask(_ length: Int) -> MLXFast.ScaledDotProductAttentionMaskMode {
+            length > 1 ? .causal : .none
+        }
+
+        mutating func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+            if let keys, let values {
+                self.keys = concatenated([keys, newKeys], axis: 2)
+                self.values = concatenated([values, newValues], axis: 2)
+            } else {
+                keys = newKeys
+                values = newValues
+            }
+            return (keys!, values!)
+        }
+    }
+
+    /// mlx-lm's BatchKVCache: rows left-padded to one length, each with its own offset. Keys
+    /// and values are kept at exactly `length` (mlx-lm allocates in steps of 256; past
+    /// `length` its buffer holds nothing any mask lets through, so the two agree).
+    struct BatchKVCache: LayerCache {
+        var keys: MLXArray?
+        var values: MLXArray?
+        var leftPadding: [Int]
+        var offsets: [Int]
+        var length = 0
+        var rightPadding: [Int]?
+
+        init(leftPadding: [Int]) {
+            self.leftPadding = leftPadding
+            offsets = leftPadding.map { -$0 }
+        }
+
+        static func merge(_ caches: [KVCache]) -> BatchKVCache {
+            let lengths = caches.map(\.offset)
+            let longest = lengths.max() ?? 0
+            var batch = BatchKVCache(leftPadding: lengths.map { longest - $0 })
+            guard longest > 0, let template = caches.first(where: { $0.keys != nil })?.keys,
+                let valueTemplate = caches.first(where: { $0.values != nil })?.values
+            else { return batch }
+            func padded(_ array: MLXArray?, like template: MLXArray, by padding: Int) -> MLXArray {
+                let shape = [1, template.dim(1), padding, template.dim(3)]
+                guard let array else {
+                    return MLXArray.zeros([1, template.dim(1), longest, template.dim(3)], dtype: template.dtype)
+                }
+                return padding == 0 ? array : concatenated([MLXArray.zeros(shape, dtype: template.dtype), array], axis: 2)
+            }
+            batch.keys = concatenated(
+                zip(caches, batch.leftPadding).map { padded($0.keys, like: template, by: $1) }, axis: 0)
+            batch.values = concatenated(
+                zip(caches, batch.leftPadding).map { padded($0.values, like: valueTemplate, by: $1) }, axis: 0)
+            batch.offsets = batch.offsets.map { $0 + longest }
+            batch.length = longest
+            return batch
+        }
+
+        func rope(_ x: MLXArray, headDim: Int, freqs: MLXArray) -> MLXArray {
+            MLXFast.RoPE(
+                x, dimensions: headDim, traditional: false, base: nil, scale: 1,
+                offset: MLXArray(offsets.map(Int32.init)), freqs: freqs)
+        }
+
+        /// mlx-lm's create_causal_mask(N, offset: length, left_padding:)
+        func mask(_ count: Int) -> MLXFast.ScaledDotProductAttentionMaskMode {
+            let columns = MLXArray(Int32(0) ..< Int32(length + count))
+            let rows = MLXArray(Int32(length) ..< Int32(length + count))
+            var mask = rows.expandedDimensions(axis: 1) .>= columns.expandedDimensions(axis: 0)
+            let padding = MLXArray(leftPadding.map(Int32.init)).reshaped(-1, 1, 1, 1)
+            mask = mask .&& (padding .<= columns.reshaped(1, 1, 1, -1))
+            return .array(mask)
+        }
+
+        mutating func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+            if let keys, let values {
+                self.keys = concatenated([keys, newKeys], axis: 2)
+                self.values = concatenated([values, newValues], axis: 2)
+            } else {
+                keys = newKeys
+                values = newValues
+            }
+            length += newKeys.dim(2)
+            offsets = offsets.map { $0 + newKeys.dim(2) }
+            return (keys!, values!)
+        }
+
+        mutating func prepare(leftPadding added: [Int], rightPadding: [Int]) {
+            if !added.isEmpty {
+                leftPadding = zip(leftPadding, added).map(+)
+                offsets = zip(offsets, added).map(-)
+            }
+            if (rightPadding.max() ?? 0) > 0 { self.rightPadding = rightPadding }
+        }
+
+        /// Turn right padding into left padding: roll each row right by its padding
+        mutating func finalize() {
+            guard let padding = rightPadding else { return }
+            if let keys, let values {
+                func rolled(_ array: MLXArray) -> MLXArray {
+                    concatenated(padding.enumerated().map { row, shift in
+                        let line = array[row ..< row + 1]
+                        guard shift > 0 else { return line }
+                        let total = line.dim(2)
+                        return concatenated(
+                            [line[.ellipsis, (total - shift)..., 0...], line[.ellipsis, ..<(total - shift), 0...]],
+                            axis: 2)
+                    }, axis: 0)
+                }
+                self.keys = rolled(keys)
+                self.values = rolled(values)
+            }
+            offsets = zip(offsets, padding).map(-)
+            leftPadding = zip(leftPadding, padding).map(+)
+            rightPadding = nil
+        }
+
+        mutating func trim(_ count: Int) {
+            let dropped = min(length, count)
+            length -= dropped
+            offsets = offsets.map { $0 - dropped }
+            if let keys, let values {
+                self.keys = keys[.ellipsis, ..<length, 0...]
+                self.values = values[.ellipsis, ..<length, 0...]
+            }
+        }
+
+        mutating func filter(_ rows: [Int]) {
+            if let keys, let values, !rows.isEmpty {
+                let index = MLXArray(rows.map(Int32.init))
+                self.keys = keys[index]
+                self.values = values[index]
+            } else if rows.isEmpty {
+                keys = nil
+                values = nil
+            }
+            offsets = rows.map { offsets[$0] }
+            leftPadding = rows.map { leftPadding[$0] }
+            // Drop the padding every row has
+            if let least = leftPadding.min(), least > 0 {
+                if let keys, let values {
+                    self.keys = keys[.ellipsis, least..., 0...]
+                    self.values = values[.ellipsis, least..., 0...]
+                }
+                length -= least
+                leftPadding = leftPadding.map { $0 - least }
+            }
+        }
+
+        mutating func extend(_ other: BatchKVCache) {
+            if keys == nil && other.keys == nil {
+                leftPadding += other.leftPadding
+                offsets += other.offsets
+                return
+            }
+            let longest = max(length, other.length)
+            let template = (keys ?? other.keys)!
+            let valueTemplate = (values ?? other.values)!
+            func padded(_ cache: BatchKVCache) -> (MLXArray, MLXArray, [Int]) {
+                let rows = cache.offsets.count
+                let left = longest - cache.length
+                var k = cache.keys ?? MLXArray.zeros([rows, template.dim(1), 0, template.dim(3)], dtype: template.dtype)
+                var v = cache.values ?? MLXArray.zeros([rows, valueTemplate.dim(1), 0, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+                if left > 0 {
+                    k = concatenated([MLXArray.zeros([rows, k.dim(1), left, k.dim(3)], dtype: k.dtype), k], axis: 2)
+                    v = concatenated([MLXArray.zeros([rows, v.dim(1), left, v.dim(3)], dtype: v.dtype), v], axis: 2)
+                }
+                return (k, v, cache.leftPadding.map { $0 + left })
+            }
+            let (k1, v1, p1) = padded(self)
+            let (k2, v2, p2) = padded(other)
+            keys = concatenated([k1, k2], axis: 0)
+            values = concatenated([v1, v2], axis: 0)
+            leftPadding = p1 + p2
+            offsets += other.offsets
+            length = longest
+        }
+
+        func extract(_ row: Int) -> KVCache {
+            guard let keys, let values else { return KVCache() }
+            let padding = leftPadding[row]
+            return KVCache(
+                keys: keys[row ..< row + 1, 0..., padding ..< length, 0...],
+                values: values[row ..< row + 1, 0..., padding ..< length, 0...])
         }
     }
 
@@ -85,10 +282,9 @@ enum LlamaShard {
         return (layers, ropeFrequencies)
     }
 
-    static func forward(
-        _ x: MLXArray, layer: Layer, cache: inout KVCache, ropeFrequencies: MLXArray
+    static func forward<Cache: LayerCache>(
+        _ x: MLXArray, layer: Layer, cache: inout Cache, ropeFrequencies: MLXArray
     ) -> MLXArray {
-        let offset = cache.offset
         let (heads, kvHeads, headDim, normEpsilon) = (
             layer.config.heads, layer.config.kvHeads, layer.config.headDim, layer.config.normEpsilon)
         let batch = x.dim(0)
@@ -102,23 +298,14 @@ enum LlamaShard {
         var values = layer.linear(normed, "self_attn.v_proj")
             .reshaped(batch, length, kvHeads, headDim).transposed(0, 2, 1, 3)
 
-        queries = MLXFast.RoPE(
-            queries, dimensions: headDim, traditional: false, base: nil, scale: 1, offset: offset,
-            freqs: ropeFrequencies)
-        keys = MLXFast.RoPE(
-            keys, dimensions: headDim, traditional: false, base: nil, scale: 1, offset: offset,
-            freqs: ropeFrequencies)
-
-        if let cachedKeys = cache.keys, let cachedValues = cache.values {
-            keys = concatenated([cachedKeys, keys], axis: 2)
-            values = concatenated([cachedValues, values], axis: 2)
-        }
-        cache.keys = keys
-        cache.values = values
+        queries = cache.rope(queries, headDim: headDim, freqs: ropeFrequencies)
+        keys = cache.rope(keys, headDim: headDim, freqs: ropeFrequencies)
+        let mask = cache.mask(length)
+        (keys, values) = cache.update(keys: keys, values: values)
 
         let attention = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: 1 / Float(headDim).squareRoot(),
-            mask: length > 1 ? .causal : .none)
+            mask: mask)
         let attended = x + layer.linear(
             attention.transposed(0, 2, 1, 3).reshaped(batch, length, heads * headDim),
             "self_attn.o_proj")

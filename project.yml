@@ -13,6 +13,14 @@ targets:
     type: application
     platform: iOS
     sources: [Sources]
+    entitlements:
+      path: ExoIPadSpike.entitlements
+      properties:
+        # Lets iPadOS give this app more memory before it ends it (the default limit leaves
+        # about a third of a 16 GB iPad): a stage holds a model's layers and their KV caches
+        com.apple.developer.kernel.increased-memory-limit: true
+        # A larger virtual address space, for arrays past the default per-app limit
+        com.apple.developer.kernel.extended-virtual-addressing: true
     dependencies:
       - package: MLXSwift
         product: MLX
