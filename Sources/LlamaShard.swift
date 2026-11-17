@@ -6,16 +6,35 @@ import MLX
 /// [1, L, 2048] float16 hidden state per step; this runs its layers with a KV cache and
 /// sends the result back. A header of 0 ends the run.
 enum LlamaShard {
-    static let hiddenSize = 2048
-    static let heads = 32
-    static let kvHeads = 8
-    static let headDim = 64
-    static let normEpsilon: Float = 1e-5
-    static let groupSize = 64
-    static let bits = 4
+    /// A Llama model's shape: Llama-3.2-1B-Instruct-4bit by default, else from its config.json
+    struct Config {
+        var hiddenSize = 2048
+        var heads = 32
+        var kvHeads = 8
+        var headDim = 64
+        var normEpsilon: Float = 1e-5
+        var groupSize = 64
+        var bits = 4
+
+        init() {}
+
+        init(json: [String: Any]) {
+            func int(_ key: String) -> Int? { (json[key] as? NSNumber)?.intValue }
+            hiddenSize = int("hidden_size") ?? hiddenSize
+            heads = int("num_attention_heads") ?? heads
+            kvHeads = int("num_key_value_heads") ?? heads
+            headDim = int("head_dim") ?? hiddenSize / heads
+            normEpsilon = (json["rms_norm_eps"] as? NSNumber)?.floatValue ?? normEpsilon
+            if let quantization = json["quantization"] as? [String: Any] {
+                groupSize = (quantization["group_size"] as? NSNumber)?.intValue ?? groupSize
+                bits = (quantization["bits"] as? NSNumber)?.intValue ?? bits
+            }
+        }
+    }
 
     struct Layer {
         let weights: [String: MLXArray]
+        var config = Config()
 
         func weight(_ name: String) -> MLXArray {
             guard let array = weights[name] else { fatalError("missing weight \(name)") }
@@ -26,7 +45,7 @@ enum LlamaShard {
             quantizedMatmul(
                 x, weight(name + ".weight"), scales: weight(name + ".scales"),
                 biases: weight(name + ".biases"), transpose: true,
-                groupSize: LlamaShard.groupSize, bits: LlamaShard.bits)
+                groupSize: config.groupSize, bits: config.bits)
         }
     }
 
@@ -47,7 +66,11 @@ enum LlamaShard {
 
     /// This stage's layers and the llama3 RoPE frequencies, from a shard made by mac/make_shard.py
     static func loadLayers(shard: URL) throws -> (layers: [Layer], ropeFrequencies: MLXArray) {
-        let arrays = try loadArrays(url: shard)
+        try loadLayers(arrays: try loadArrays(url: shard), config: Config())
+    }
+
+    /// Layers named layers.0.., plus rope_freqs
+    static func loadLayers(arrays: [String: MLXArray], config: Config) throws -> (layers: [Layer], ropeFrequencies: MLXArray) {
         guard let ropeFrequencies = arrays["rope_freqs"] else { fatalError("shard has no rope_freqs") }
         var layers: [Layer] = []
         while true {
@@ -56,7 +79,7 @@ enum LlamaShard {
             if layerWeights.isEmpty { break }
             layers.append(Layer(weights: Dictionary(uniqueKeysWithValues: layerWeights.map {
                 (String($0.key.dropFirst(prefix.count)), $0.value)
-            })))
+            }), config: config))
         }
         eval(Array(arrays.values))
         return (layers, ropeFrequencies)
@@ -66,6 +89,8 @@ enum LlamaShard {
         _ x: MLXArray, layer: Layer, cache: inout KVCache, ropeFrequencies: MLXArray
     ) -> MLXArray {
         let offset = cache.offset
+        let (heads, kvHeads, headDim, normEpsilon) = (
+            layer.config.heads, layer.config.kvHeads, layer.config.headDim, layer.config.normEpsilon)
         let batch = x.dim(0)
         let length = x.dim(1)
 
@@ -130,7 +155,7 @@ enum LlamaShard {
             let length = Int(header.item(Int32.self))
             if length == 0 { break }
 
-            var hidden = MLXDistributed.recv([1, length, hiddenSize], dtype: .float16, from: peer, group: group)
+            var hidden = MLXDistributed.recv([1, length, Config().hiddenSize], dtype: .float16, from: peer, group: group)
             eval(hidden)
             let computeStarted = Date()
             for index in layers.indices {

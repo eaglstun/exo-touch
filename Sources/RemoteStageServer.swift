@@ -6,7 +6,7 @@ import MLX
 /// A node connects, sends hidden states for this stage's layers and keeps their KV caches
 /// here, named by handles it picks.
 enum RemoteStageServer {
-    static let protocolVersion = 1
+    static let protocolVersion = 2
 
     /// protocol.py's Frame: every field, snake_case on the wire
     struct Frame: Codable {
@@ -18,6 +18,7 @@ enum RemoteStageServer {
         var dtype = ""
         var payloadBytes = 0
         var protocolVersion = 0
+        var configJson = ""
         var layerCount = 0
         var kvBytesPerToken = 0
         var liveCaches = 0
@@ -26,11 +27,9 @@ enum RemoteStageServer {
 
     struct ConnectionClosed: Error {}
 
-    static func serve(port: UInt16, shard: URL, log: @escaping (String) -> Void) throws {
+    /// Serve nodes one at a time on `port`. A node sends the layers it wants run in `load`.
+    static func serve(port: UInt16, log: @escaping (String) -> Void) throws {
         var started = Date()
-        let (layers, ropeFrequencies) = try LlamaShard.loadLayers(shard: shard)
-        log(String(format: "loaded %d layers in %.2fs", layers.count, Date().timeIntervalSince(started)))
-
         let listener = socket(AF_INET, SOCK_STREAM, 0)
         var yes: Int32 = 1
         setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
@@ -55,8 +54,7 @@ enum RemoteStageServer {
             setsockopt(connection, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
             log("node connected")
             started = Date()
-            let (forwards, handles) = serveConnection(
-                connection, layers: layers, ropeFrequencies: ropeFrequencies)
+            let (forwards, handles) = serveConnection(connection, log: log)
             close(connection)
             log(String(
                 format: "node disconnected after %.1fs: %d forwards, dropped %d caches",
@@ -66,8 +64,11 @@ enum RemoteStageServer {
 
     /// Serves one node until it disconnects. Returns the forwards run and the caches dropped.
     static func serveConnection(
-        _ connection: Int32, layers: [LlamaShard.Layer], ropeFrequencies: MLXArray
+        _ connection: Int32, log: @escaping (String) -> Void
     ) -> (Int, Int) {
+        var layers: [LlamaShard.Layer] = []
+        var ropeFrequencies = MLXArray(0)
+        var kvBytesPerToken = 0
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let encoder = JSONEncoder()
@@ -94,12 +95,27 @@ enum RemoteStageServer {
 
                 switch frame.operation {
                 case "hello":
-                    // Keys and values per token: layers x 2 x kv heads x head dim, float16
+                    try send(Frame(operation: "welcome", protocolVersion: protocolVersion))
+                case "load":
+                    let started = Date()
+                    let json = try JSONSerialization.jsonObject(with: Data(frame.configJson.utf8))
+                    let config = LlamaShard.Config(json: json as? [String: Any] ?? [:])
+                    caches.removeAll()
+                    (layers, ropeFrequencies) = try LlamaShard.loadLayers(
+                        arrays: try loadArrays(data: payload), config: config)
+                    // Keys and values per token: layers x 2 x kv heads x head dim, in the
+                    // activations' dtype
+                    let itemSize = layers.first?.weights["input_layernorm.weight"]?.itemSize ?? 2
+                    kvBytesPerToken = layers.count * 2 * config.kvHeads * config.headDim * itemSize
+                    log(String(
+                        format: "loaded %d layers (%.0f MB) in %.2fs", layers.count,
+                        Double(payload.count) / 1e6, Date().timeIntervalSince(started)))
                     try send(Frame(
-                        operation: "welcome", protocolVersion: protocolVersion, layerCount: layers.count,
-                        kvBytesPerToken: layers.count * 2 * LlamaShard.kvHeads * LlamaShard.headDim * 2))
+                        operation: "loaded", layerCount: layers.count, kvBytesPerToken: kvBytesPerToken))
                 case "new":
-                    caches[frame.handle] = Array(repeating: LlamaShard.KVCache(), count: layers.count)
+                    if !layers.isEmpty {
+                        caches[frame.handle] = Array(repeating: LlamaShard.KVCache(), count: layers.count)
+                    }
                 case "copy":
                     // MLX arrays never change in place, so a copy shares them
                     caches[frame.handle] = caches[frame.source]

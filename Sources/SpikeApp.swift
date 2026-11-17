@@ -81,13 +81,11 @@ struct ContentView: View {
 
     /// Serve exo's remote stage protocol on `port` until the app quits
     private func startStage(port: UInt16) {
-        let shard = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ipad_shard.safetensors")
         log.running = true
         let log = self.log
         Task.detached {
             do {
-                try RemoteStageServer.serve(port: port, shard: shard) { line in
+                try RemoteStageServer.serve(port: port) { line in
                     Task { @MainActor in log.add(line) }
                 }
             } catch {
