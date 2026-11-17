@@ -10,7 +10,7 @@ import os
 /// thread, layers and caches: a proxy node asks for this device's memory on a connection of
 /// its own while its runner's is busy.
 enum RemoteStageServer {
-    static let protocolVersion = 4
+    static let protocolVersion = 5
 
     /// protocol.py's Frame: every field, snake_case on the wire
     struct Frame: Codable {
@@ -33,16 +33,106 @@ enum RemoteStageServer {
         var configJson = ""
         var layerCount = 0
         var kvBytesPerToken = 0
+        var stateBytes = 0
         var liveCaches = 0
         var message = ""
     }
 
     struct ConnectionClosed: Error {}
 
+    /// One layer's cache of one sequence: keys and values, or a linear attention layer's
+    /// recurrent state
+    enum SequenceCache {
+        case attention(LlamaShard.KVCache)
+        case linear(LlamaShard.RecurrentCache)
+    }
+
+    /// One layer's cache of a batch (mlx-lm keeps a linear attention layer's state in the
+    /// same ArraysCache for a batch as for one sequence)
+    enum BatchCache {
+        case attention(LlamaShard.BatchKVCache)
+        case linear(LlamaShard.RecurrentCache)
+    }
+
     /// What a handle names: one sequence's caches, or a batch's, one per layer
     enum Caches {
-        case single([LlamaShard.KVCache])
-        case batch([LlamaShard.BatchKVCache])
+        case single([SequenceCache])
+        case batch([BatchCache])
+    }
+
+    /// Run `layers` over `hidden`, each with its cache
+    static func forward(
+        _ hidden: MLXArray, layers: [LlamaShard.Layer], caches: inout [SequenceCache],
+        ropeFrequencies: MLXArray
+    ) -> MLXArray {
+        var hidden = hidden
+        for index in layers.indices {
+            switch caches[index] {
+            case .attention(var cache):
+                hidden = LlamaShard.forward(hidden, layer: layers[index], cache: &cache, ropeFrequencies: ropeFrequencies)
+                caches[index] = .attention(cache)
+            case .linear(var cache):
+                hidden = LlamaShard.forward(hidden, layer: layers[index], cache: &cache)
+                caches[index] = .linear(cache)
+            }
+        }
+        return hidden
+    }
+
+    static func forward(
+        _ hidden: MLXArray, layers: [LlamaShard.Layer], caches: inout [BatchCache],
+        ropeFrequencies: MLXArray
+    ) -> MLXArray {
+        var hidden = hidden
+        for index in layers.indices {
+            switch caches[index] {
+            case .attention(var cache):
+                hidden = LlamaShard.forward(hidden, layer: layers[index], cache: &cache, ropeFrequencies: ropeFrequencies)
+                caches[index] = .attention(cache)
+            case .linear(var cache):
+                hidden = LlamaShard.forward(hidden, layer: layers[index], cache: &cache)
+                caches[index] = .linear(cache)
+            }
+        }
+        return hidden
+    }
+
+    /// Every array the caches hold: evaluated after each forward, so a copy of a cache holds
+    /// arrays, not a graph that grows (nothing else in a step reads the convolution's state)
+    static func arrays(_ caches: Caches) -> [MLXArray] {
+        switch caches {
+        case .single(let layers):
+            layers.flatMap { cache -> [MLXArray] in
+                switch cache {
+                case .attention(let kv): [kv.keys, kv.values].compactMap { $0 }
+                case .linear(let recurrent): recurrent.arrays
+                }
+            }
+        case .batch(let layers):
+            layers.flatMap { cache -> [MLXArray] in
+                switch cache {
+                case .attention(let kv): [kv.keys, kv.values].compactMap { $0 }
+                case .linear(let recurrent): recurrent.arrays
+                }
+            }
+        }
+    }
+
+    /// The same change to each layer's batch cache, by kind
+    static func eachBatch(
+        _ caches: [BatchCache], attention: (inout LlamaShard.BatchKVCache) -> Void,
+        linear: (inout LlamaShard.RecurrentCache) -> Void
+    ) -> [BatchCache] {
+        caches.map {
+            switch $0 {
+            case .attention(var cache):
+                attention(&cache)
+                return .attention(cache)
+            case .linear(var cache):
+                linear(&cache)
+                return .linear(cache)
+            }
+        }
     }
 
     /// Serve nodes on `port`, each connection on its own thread. A node sends the layers it
@@ -135,7 +225,8 @@ enum RemoteStageServer {
         encoder.keyEncodingStrategy = .convertToSnakeCase
         var caches: [Int: Caches] = [:]
 
-        func batch(_ handle: Int) -> [LlamaShard.BatchKVCache] {
+        var stateBytes = 0
+        func batch(_ handle: Int) -> [BatchCache] {
             guard case .batch(let layers) = caches[handle] else { return [] }
             return layers
         }
@@ -191,7 +282,15 @@ enum RemoteStageServer {
                         // Keys and values per token: layers x 2 x kv heads x head dim, in the
                         // activations' dtype
                         let itemSize = layers.first?.weights["input_layernorm.weight"]?.itemSize ?? 2
-                        kvBytesPerToken = layers.count * 2 * config.kvHeads * config.headDim * itemSize
+                        let attentionLayers = layers.filter { !$0.isLinear }.count
+                        kvBytesPerToken = attentionLayers * 2 * config.kvHeads * config.headDim * itemSize
+                        // A linear attention layer's state: (kernel - 1) convolution inputs in
+                        // the activations' dtype, and a float32 state per value head
+                        let convWidth = 2 * config.linearKeyHeads * config.linearKeyDim
+                            + config.linearValueHeads * config.linearValueDim
+                        let perLinearLayer = (config.convKernel - 1) * convWidth * itemSize
+                            + config.linearValueHeads * config.linearValueDim * config.linearKeyDim * 4
+                        stateBytes = (layers.count - attentionLayers) * perLinearLayer
                         log(String(
                             format: "loaded %d layers in %.2fs; %.0f MB left to this app",
                             layers.count, Date().timeIntervalSince(loadStarted),
@@ -199,10 +298,13 @@ enum RemoteStageServer {
                     }
                     try send(Frame(
                         operation: "loaded", layerCount: received,
-                        kvBytesPerToken: layers.isEmpty ? 0 : kvBytesPerToken))
+                        kvBytesPerToken: layers.isEmpty ? 0 : kvBytesPerToken,
+                        stateBytes: layers.isEmpty ? 0 : stateBytes))
                 case "new":
                     if !layers.isEmpty {
-                        caches[frame.handle] = .single(Array(repeating: LlamaShard.KVCache(), count: layers.count))
+                        caches[frame.handle] = .single(layers.map {
+                            $0.isLinear ? .linear(LlamaShard.RecurrentCache()) : .attention(LlamaShard.KVCache())
+                        })
                     }
                 case "copy":
                     // MLX arrays never change in place, so a copy shares them
@@ -210,56 +312,75 @@ enum RemoteStageServer {
                 case "free":
                     caches[frame.handle] = nil
                 case "truncate":
+                    // Only a stage without recurrent state is sent truncate: a node goes back
+                    // to a copy instead
                     if case .single(let layerCaches) = caches[frame.handle] {
-                        caches[frame.handle] = .single(layerCaches.map { $0.truncated(to: frame.offset) })
+                        caches[frame.handle] = .single(layerCaches.map {
+                            guard case .attention(let cache) = $0 else { return $0 }
+                            return .attention(cache.truncated(to: frame.offset))
+                        })
                     }
                 case "merge":
-                    let sequences = frame.sources.compactMap { source -> [LlamaShard.KVCache]? in
+                    let sequences = frame.sources.compactMap { source -> [SequenceCache]? in
                         guard case .single(let layerCaches) = caches[source] else { return nil }
                         return layerCaches
                     }
-                    caches[frame.handle] = .batch(layers.indices.map { layer in
-                        LlamaShard.BatchKVCache.merge(sequences.map { $0[layer] })
+                    caches[frame.handle] = .batch(layers.indices.map { layer -> BatchCache in
+                        if layers[layer].isLinear {
+                            return .linear(LlamaShard.RecurrentCache.merge(sequences.map {
+                                guard case .linear(let cache) = $0[layer] else { return LlamaShard.RecurrentCache() }
+                                return cache
+                            }))
+                        }
+                        return .attention(LlamaShard.BatchKVCache.merge(sequences.map {
+                            guard case .attention(let cache) = $0[layer] else { return LlamaShard.KVCache() }
+                            return cache
+                        }))
                     })
                 case "extend":
                     let other = batch(frame.source)
-                    caches[frame.handle] = .batch(zip(batch(frame.handle), other).map {
-                        var cache = $0
-                        cache.extend($1)
-                        return cache
+                    caches[frame.handle] = .batch(zip(batch(frame.handle), other).map { own, theirs in
+                        switch (own, theirs) {
+                        case (.attention(var cache), .attention(let other)):
+                            cache.extend(other)
+                            return .attention(cache)
+                        case (.linear(var cache), .linear(let other)):
+                            cache.extend(other)
+                            return .linear(cache)
+                        default:
+                            return own
+                        }
                     })
                 case "filter":
-                    caches[frame.handle] = .batch(batch(frame.handle).map {
-                        var cache = $0
-                        cache.filter(frame.rows)
-                        return cache
-                    })
+                    caches[frame.handle] = .batch(eachBatch(
+                        batch(frame.handle), attention: { $0.filter(frame.rows) }, linear: { $0.filter(frame.rows) }))
                 case "extract":
-                    caches[frame.handle] = .single(batch(frame.source).map { $0.extract(frame.rows[0]) })
+                    caches[frame.handle] = .single(batch(frame.source).map {
+                        switch $0 {
+                        case .attention(let cache): .attention(cache.extract(frame.rows[0]))
+                        case .linear(let cache): .linear(cache.extract(frame.rows[0]))
+                        }
+                    })
                 case "prepare":
-                    caches[frame.handle] = .batch(batch(frame.handle).map {
-                        var cache = $0
-                        cache.prepare(leftPadding: frame.leftPadding, rightPadding: frame.rightPadding)
-                        return cache
-                    })
+                    // A linear attention layer's state needs nothing for left padding, the only
+                    // padding exo makes (its prepare takes lengths, for right padding)
+                    caches[frame.handle] = .batch(eachBatch(
+                        batch(frame.handle),
+                        attention: { $0.prepare(leftPadding: frame.leftPadding, rightPadding: frame.rightPadding) },
+                        linear: { _ in }))
                 case "finalize":
-                    caches[frame.handle] = .batch(batch(frame.handle).map {
-                        var cache = $0
-                        cache.finalize()
-                        return cache
-                    })
+                    caches[frame.handle] = .batch(eachBatch(
+                        batch(frame.handle), attention: { $0.finalize() }, linear: { $0.finalize() }))
                 case "trim":
                     switch caches[frame.handle] {
                     case .single(let layerCaches):
                         caches[frame.handle] = .single(layerCaches.map {
-                            $0.truncated(to: max(0, $0.offset - frame.offset))
+                            guard case .attention(let cache) = $0 else { return $0 }
+                            return .attention(cache.truncated(to: max(0, cache.offset - frame.offset)))
                         })
                     case .batch(let layerCaches):
-                        caches[frame.handle] = .batch(layerCaches.map {
-                            var cache = $0
-                            cache.trim(frame.offset)
-                            return cache
-                        })
+                        caches[frame.handle] = .batch(eachBatch(
+                            layerCaches, attention: { $0.trim(frame.offset) }, linear: { _ in }))
                     case nil:
                         break
                     }
@@ -278,26 +399,14 @@ enum RemoteStageServer {
                     var hidden = MLXArray(payload, frame.shape, dtype: dtype)
                     switch entry {
                     case .single(var layerCaches):
-                        for index in layers.indices {
-                            hidden = LlamaShard.forward(
-                                hidden, layer: layers[index], cache: &layerCaches[index],
-                                ropeFrequencies: ropeFrequencies)
-                        }
-                        hidden = hidden.asType(dtype)
-                        eval(hidden)
-                        eval(layerCaches.flatMap { [$0.keys, $0.values].compactMap { $0 } })
+                        hidden = forward(hidden, layers: layers, caches: &layerCaches, ropeFrequencies: ropeFrequencies)
                         caches[frame.handle] = .single(layerCaches)
                     case .batch(var layerCaches):
-                        for index in layers.indices {
-                            hidden = LlamaShard.forward(
-                                hidden, layer: layers[index], cache: &layerCaches[index],
-                                ropeFrequencies: ropeFrequencies)
-                        }
-                        hidden = hidden.asType(dtype)
-                        eval(hidden)
-                        eval(layerCaches.flatMap { [$0.keys, $0.values].compactMap { $0 } })
+                        hidden = forward(hidden, layers: layers, caches: &layerCaches, ropeFrequencies: ropeFrequencies)
                         caches[frame.handle] = .batch(layerCaches)
                     }
+                    hidden = hidden.asType(dtype)
+                    eval([hidden] + arrays(caches[frame.handle]!))
                     let data = hidden.asData(access: .copy).data
                     try send(
                         Frame(

@@ -8,8 +8,9 @@ import MLX
 /// sends the result back. A header of 0 ends the run.
 enum LlamaShard {
     /// The model types whose layers this stage runs: Llama's, Qwen3's (which also norms each
-    /// head's queries and keys), and Qwen3's mixture of experts
-    static let modelTypes: Set<String> = ["llama", "qwen3", "qwen3_moe"]
+    /// head's queries and keys), Qwen3's mixture of experts, and Qwen3.5's (linear attention
+    /// layers with a recurrent state, and attention with a gated output)
+    static let modelTypes: Set<String> = ["llama", "qwen3", "qwen3_moe", "qwen3_5"]
 
     /// How a module's weights are quantized
     struct Quantization {
@@ -32,6 +33,12 @@ enum LlamaShard {
         // A mixture of experts
         var expertsPerToken = 0
         var normalizeExpertScores = false
+        // Linear attention (Qwen3.5)
+        var linearKeyHeads = 0
+        var linearValueHeads = 0
+        var linearKeyDim = 0
+        var linearValueDim = 0
+        var convKernel = 4
 
         init() {}
 
@@ -45,6 +52,11 @@ enum LlamaShard {
             normEpsilon = (json["rms_norm_eps"] as? NSNumber)?.floatValue ?? normEpsilon
             expertsPerToken = int("num_experts_per_tok") ?? 0
             normalizeExpertScores = (json["norm_topk_prob"] as? NSNumber)?.boolValue ?? false
+            linearKeyHeads = int("linear_num_key_heads") ?? 0
+            linearValueHeads = int("linear_num_value_heads") ?? 0
+            linearKeyDim = int("linear_key_head_dim") ?? 0
+            linearValueDim = int("linear_value_head_dim") ?? 0
+            convKernel = int("linear_conv_kernel_dim") ?? convKernel
             func parsed(_ entry: [String: Any], else fallback: Quantization) -> Quantization {
                 Quantization(
                     groupSize: (entry["group_size"] as? NSNumber)?.intValue ?? fallback.groupSize,
@@ -71,6 +83,9 @@ enum LlamaShard {
             guard let array = weights[name] else { fatalError("missing weight \(name)") }
             return array
         }
+
+        /// A linear attention layer (Qwen3.5), which keeps a recurrent state, not keys and values
+        var isLinear: Bool { weights["linear_attn.A_log"] != nil }
 
         func quantization(of module: String) -> Quantization {
             quantization[module] ?? config.quantization
@@ -118,9 +133,11 @@ enum LlamaShard {
         }
 
         func rope(_ x: MLXArray, headDim: Int, freqs: MLXArray) -> MLXArray {
+            // As many of each head's dimensions as there are frequencies for (Qwen3.5 rotates a
+            // quarter of them)
             MLXFast.RoPE(
-                x, dimensions: headDim, traditional: false, base: nil, scale: 1, offset: offset,
-                freqs: freqs)
+                x, dimensions: freqs.dim(0) * 2, traditional: false, base: nil, scale: 1,
+                offset: offset, freqs: freqs)
         }
 
         func mask(_ length: Int) -> MLXFast.ScaledDotProductAttentionMaskMode {
@@ -180,7 +197,7 @@ enum LlamaShard {
 
         func rope(_ x: MLXArray, headDim: Int, freqs: MLXArray) -> MLXArray {
             MLXFast.RoPE(
-                x, dimensions: headDim, traditional: false, base: nil, scale: 1,
+                x, dimensions: freqs.dim(0) * 2, traditional: false, base: nil, scale: 1,
                 offset: MLXArray(offsets.map(Int32.init)), freqs: freqs)
         }
 
@@ -333,7 +350,34 @@ enum LlamaShard {
         return (layers, ropeFrequencies)
     }
 
+    /// An attention layer, given its cache
     static func forward<Cache: LayerCache>(
+        _ x: MLXArray, layer: Layer, cache: inout Cache, ropeFrequencies: MLXArray
+    ) -> MLXArray {
+        block(x, layer: layer) { attention($0, layer: layer, cache: &cache, ropeFrequencies: ropeFrequencies) }
+    }
+
+    /// A linear attention layer, given its cache
+    static func forward(_ x: MLXArray, layer: Layer, cache: inout RecurrentCache) -> MLXArray {
+        block(x, layer: layer) { linearAttention($0, layer: layer, cache: &cache) }
+    }
+
+    /// A decoder layer around its attention (`mix`): normed, mixed, then its MLP or experts
+    static func block(_ x: MLXArray, layer: Layer, mix: (MLXArray) -> MLXArray) -> MLXArray {
+        let normEpsilon = layer.config.normEpsilon
+        let normed = MLXFast.rmsNorm(x, weight: layer.weight("input_layernorm.weight"), eps: normEpsilon)
+        let attended = x + mix(normed)
+        let normedAgain = MLXFast.rmsNorm(
+            attended, weight: layer.weight("post_attention_layernorm.weight"), eps: normEpsilon)
+        if layer.weights["mlp.switch_mlp.gate_proj.weight"] != nil {
+            return attended + mixtureOfExperts(normedAgain, layer: layer)
+        }
+        let gate = layer.linear(normedAgain, "mlp.gate_proj")
+        let up = layer.linear(normedAgain, "mlp.up_proj")
+        return attended + layer.linear(gate * sigmoid(gate) * up, "mlp.down_proj")
+    }
+
+    static func attention<Cache: LayerCache>(
         _ x: MLXArray, layer: Layer, cache: inout Cache, ropeFrequencies: MLXArray
     ) -> MLXArray {
         let (heads, kvHeads, headDim, normEpsilon) = (
@@ -341,9 +385,19 @@ enum LlamaShard {
         let batch = x.dim(0)
         let length = x.dim(1)
 
-        let normed = MLXFast.rmsNorm(x, weight: layer.weight("input_layernorm.weight"), eps: normEpsilon)
-        var queries = layer.linear(normed, "self_attn.q_proj").reshaped(batch, length, heads, headDim)
-        var keys = layer.linear(normed, "self_attn.k_proj").reshaped(batch, length, kvHeads, headDim)
+        var queries = layer.linear(x, "self_attn.q_proj")
+        // Qwen3.5's attention gates its output: q_proj makes each head's queries and gate
+        var gate: MLXArray? = nil
+        if queries.dim(-1) == 2 * heads * headDim {
+            let parts = split(queries.reshaped(batch, length, heads, 2 * headDim), parts: 2, axis: -1)
+            queries = parts[0]
+            gate = parts[1].reshaped(batch, length, heads * headDim)
+        } else {
+            queries = queries.reshaped(batch, length, heads, headDim)
+        }
+        var keys = layer.linear(x, "self_attn.k_proj").reshaped(batch, length, kvHeads, headDim)
+        var values = layer.linear(x, "self_attn.v_proj")
+            .reshaped(batch, length, kvHeads, headDim).transposed(0, 2, 1, 3)
         // Qwen3 norms each head's queries and keys before RoPE
         if let queryNorm = layer.weights["self_attn.q_norm.weight"],
             let keyNorm = layer.weights["self_attn.k_norm.weight"]
@@ -353,29 +407,84 @@ enum LlamaShard {
         }
         queries = queries.transposed(0, 2, 1, 3)
         keys = keys.transposed(0, 2, 1, 3)
-        var values = layer.linear(normed, "self_attn.v_proj")
-            .reshaped(batch, length, kvHeads, headDim).transposed(0, 2, 1, 3)
 
         queries = cache.rope(queries, headDim: headDim, freqs: ropeFrequencies)
         keys = cache.rope(keys, headDim: headDim, freqs: ropeFrequencies)
         let mask = cache.mask(length)
         (keys, values) = cache.update(keys: keys, values: values)
 
-        let attention = MLXFast.scaledDotProductAttention(
+        var attention = attend(
             queries: queries, keys: keys, values: values, scale: 1 / Float(headDim).squareRoot(),
-            mask: mask)
-        let attended = x + layer.linear(
-            attention.transposed(0, 2, 1, 3).reshaped(batch, length, heads * headDim),
-            "self_attn.o_proj")
+            mask: mask
+        ).transposed(0, 2, 1, 3).reshaped(batch, length, heads * headDim)
+        if let gate { attention = attention * sigmoid(gate) }
+        return layer.linear(attention, "self_attn.o_proj")
+    }
 
-        let normedAgain = MLXFast.rmsNorm(
-            attended, weight: layer.weight("post_attention_layernorm.weight"), eps: normEpsilon)
-        if layer.weights["mlp.switch_mlp.gate_proj.weight"] != nil {
-            return attended + mixtureOfExperts(normedAgain, layer: layer)
+    /// Scaled dot-product attention. For heads 256 wide (Qwen3.5) over more than 8 queries,
+    /// MLX's own unfused fallback, op for op: on a GPU with neural accelerators (NAX) MLX
+    /// 0.32.4 picks a kernel for 1024 queries or more that fails to compile there ("Unable to
+    /// build metal library from source", attention_nax_dsplit), and below that, and on a Mac
+    /// without NAX below 2048 queries, MLX runs this fallback anyway.
+    static func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        let headDim = queries.dim(-1)
+        guard headDim == 256 && queries.dim(2) > 8 else {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         }
-        let gate = layer.linear(normedAgain, "mlp.gate_proj")
-        let up = layer.linear(normedAgain, "mlp.up_proj")
-        return attended + layer.linear(gate * sigmoid(gate) * up, "mlp.down_proj")
+        let (queryHeads, kvHeads) = (queries.dim(1), keys.dim(1))
+        let repeats = queryHeads / kvHeads
+        var q = MLXArray(scale).asType(queries.dtype) * queries
+        var k = keys
+        var v = values
+        if repeats > 1 {
+            q = unflatten(q, axis: 1, shape: [kvHeads, repeats])
+            k = expandedDimensions(k, axis: 2)
+            v = expandedDimensions(v, axis: 2)
+        }
+        var scores = matmul(q, k.swappedAxes(-1, -2))
+        var maskArray: MLXArray? = nil
+        switch mask {
+        case .causal:
+            let (keyLength, queryLength) = (k.dim(-2), q.dim(-2))
+            let offset = keyLength - queryLength
+            maskArray = MLXArray(Int32(offset) ..< Int32(queryLength + offset)).expandedDimensions(axis: 1)
+                .>= MLXArray(Int32(0) ..< Int32(keyLength)).expandedDimensions(axis: 0)
+        case .array(let given):
+            maskArray = given
+        default:
+            break
+        }
+        if var maskArray {
+            if repeats > 1 && maskArray.ndim >= 3 {
+                maskArray = maskArray.dim(-3) == 1
+                    ? expandedDimensions(maskArray, axis: -3)
+                    : unflatten(maskArray, axis: -3, shape: [kvHeads, repeats])
+            }
+            if maskArray.dtype == .bool {
+                scores = which(maskArray, scores, MLXArray(lowest(scores.dtype)).asType(scores.dtype))
+            } else {
+                scores = scores + maskArray
+            }
+        }
+        scores = softmax(scores, axis: -1, precise: true)
+        var out = matmul(scores, v)
+        if repeats > 1 {
+            out = out.flattened(start: 1, end: 2)
+        }
+        return out
+    }
+
+    /// finfo(dtype).min
+    static func lowest(_ dtype: DType) -> Float {
+        switch dtype {
+        case .float16: -65504
+        case .bfloat16: -3.3895313892515355e38
+        default: -Float.greatestFiniteMagnitude
+        }
     }
 
     /// Qwen3's mixture of experts, as mlx-lm's Qwen3MoeSparseMoeBlock and SwitchGLU compute it:
