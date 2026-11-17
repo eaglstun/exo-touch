@@ -40,11 +40,12 @@ enum RemoteStageServer {
 
     struct ConnectionClosed: Error {}
 
-    /// One layer's cache of one sequence: keys and values, or a linear attention layer's
-    /// recurrent state
+    /// One layer's cache of one sequence: keys and values, a linear attention or Mamba-2
+    /// layer's recurrent state, or none (Nemotron-H's MLP and expert layers)
     enum SequenceCache {
         case attention(LlamaShard.KVCache)
         case linear(LlamaShard.RecurrentCache)
+        case stateless
     }
 
     /// One layer's cache of a batch (mlx-lm keeps a linear attention layer's state in the
@@ -52,6 +53,7 @@ enum RemoteStageServer {
     enum BatchCache {
         case attention(LlamaShard.BatchKVCache)
         case linear(LlamaShard.RecurrentCache)
+        case stateless
     }
 
     /// What a handle names: one sequence's caches, or a batch's, one per layer
@@ -74,6 +76,8 @@ enum RemoteStageServer {
             case .linear(var cache):
                 hidden = LlamaShard.forward(hidden, layer: layers[index], cache: &cache)
                 caches[index] = .linear(cache)
+            case .stateless:
+                hidden = LlamaShard.forward(hidden, layer: layers[index])
             }
         }
         return hidden
@@ -92,6 +96,8 @@ enum RemoteStageServer {
             case .linear(var cache):
                 hidden = LlamaShard.forward(hidden, layer: layers[index], cache: &cache)
                 caches[index] = .linear(cache)
+            case .stateless:
+                hidden = LlamaShard.forward(hidden, layer: layers[index])
             }
         }
         return hidden
@@ -106,6 +112,7 @@ enum RemoteStageServer {
                 switch cache {
                 case .attention(let kv): [kv.keys, kv.values].compactMap { $0 }
                 case .linear(let recurrent): recurrent.arrays
+                case .stateless: []
                 }
             }
         case .batch(let layers):
@@ -113,6 +120,7 @@ enum RemoteStageServer {
                 switch cache {
                 case .attention(let kv): [kv.keys, kv.values].compactMap { $0 }
                 case .linear(let recurrent): recurrent.arrays
+                case .stateless: []
                 }
             }
         }
@@ -131,6 +139,8 @@ enum RemoteStageServer {
             case .linear(var cache):
                 linear(&cache)
                 return .linear(cache)
+            case .stateless:
+                return .stateless
             }
         }
     }
@@ -253,12 +263,16 @@ enum RemoteStageServer {
                 case "hello":
                     try send(welcome())
                 case "load":
-                    let json = try JSONSerialization.jsonObject(with: Data(frame.configJson.utf8))
+                    // JSON5: Python writes a non-finite number (Nemotron-H's time step limit) as
+                    // Infinity
+                    let json = try JSONSerialization.jsonObject(
+                        with: Data(frame.configJson.utf8), options: .json5Allowed)
                     let config = LlamaShard.Config(json: json as? [String: Any] ?? [:])
-                    guard LlamaShard.modelTypes.contains(config.modelType) else {
+                    guard LlamaShard.modelTypes.contains(config.modelType), config.expertGroups == 1 else {
                         try send(Frame(
                             operation: "error",
-                            message: "this stage can't run \(config.modelType) layers"))
+                            message: "this stage can't run \(config.modelType) layers"
+                                + (config.expertGroups == 1 ? "" : " with grouped expert routing")))
                         continue
                     }
                     if frame.offset == 0 {
@@ -281,16 +295,26 @@ enum RemoteStageServer {
                         arriving = [:]
                         // Keys and values per token: layers x 2 x kv heads x head dim, in the
                         // activations' dtype
-                        let itemSize = layers.first?.weights["input_layernorm.weight"]?.itemSize ?? 2
-                        let attentionLayers = layers.filter { !$0.isLinear }.count
+                        let itemSize = (layers.first?.weights["input_layernorm.weight"]
+                            ?? layers.first?.weights["norm.weight"])?.itemSize ?? 2
+                        let attentionLayers = layers.filter { $0.hasCache && !$0.isLinear }.count
                         kvBytesPerToken = attentionLayers * 2 * config.kvHeads * config.headDim * itemSize
-                        // A linear attention layer's state: (kernel - 1) convolution inputs in
-                        // the activations' dtype, and a float32 state per value head
-                        let convWidth = 2 * config.linearKeyHeads * config.linearKeyDim
-                            + config.linearValueHeads * config.linearValueDim
-                        let perLinearLayer = (config.convKernel - 1) * convWidth * itemSize
-                            + config.linearValueHeads * config.linearValueDim * config.linearKeyDim * 4
-                        stateBytes = (layers.count - attentionLayers) * perLinearLayer
+                        // A recurrent layer's state: (kernel - 1) convolution inputs in the
+                        // activations' dtype, and a float32 state: per value head (linear
+                        // attention), or per Mamba-2 head
+                        let perLinearLayer: Int
+                        if config.modelType == "nemotron_h" {
+                            let inner = config.mambaHeads * config.mambaHeadDim
+                            perLinearLayer = (config.convKernel - 1)
+                                * (inner + 2 * config.mambaGroups * config.ssmStateSize) * itemSize
+                                + inner * config.ssmStateSize * 4
+                        } else {
+                            let convWidth = 2 * config.linearKeyHeads * config.linearKeyDim
+                                + config.linearValueHeads * config.linearValueDim
+                            perLinearLayer = (config.convKernel - 1) * convWidth * itemSize
+                                + config.linearValueHeads * config.linearValueDim * config.linearKeyDim * 4
+                        }
+                        stateBytes = layers.filter(\.isLinear).count * perLinearLayer
                         log(String(
                             format: "loaded %d layers in %.2fs; %.0f MB left to this app",
                             layers.count, Date().timeIntervalSince(loadStarted),
@@ -303,7 +327,8 @@ enum RemoteStageServer {
                 case "new":
                     if !layers.isEmpty {
                         caches[frame.handle] = .single(layers.map {
-                            $0.isLinear ? .linear(LlamaShard.RecurrentCache()) : .attention(LlamaShard.KVCache())
+                            !$0.hasCache ? .stateless
+                                : $0.isLinear ? .linear(LlamaShard.RecurrentCache()) : .attention(LlamaShard.KVCache())
                         })
                     }
                 case "copy":
@@ -326,6 +351,7 @@ enum RemoteStageServer {
                         return layerCaches
                     }
                     caches[frame.handle] = .batch(layers.indices.map { layer -> BatchCache in
+                        if !layers[layer].hasCache { return .stateless }
                         if layers[layer].isLinear {
                             return .linear(LlamaShard.RecurrentCache.merge(sequences.map {
                                 guard case .linear(let cache) = $0[layer] else { return LlamaShard.RecurrentCache() }
@@ -359,6 +385,7 @@ enum RemoteStageServer {
                         switch $0 {
                         case .attention(let cache): .attention(cache.extract(frame.rows[0]))
                         case .linear(let cache): .linear(cache.extract(frame.rows[0]))
+                        case .stateless: .stateless
                         }
                     })
                 case "prepare":

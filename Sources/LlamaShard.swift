@@ -10,8 +10,11 @@ enum LlamaShard {
     /// The model types whose layers this stage runs: Llama's, Qwen3's (which also norms each
     /// head's queries and keys), Qwen3's mixture of experts, and Qwen3.5's (linear attention
     /// layers with a recurrent state, and attention with a gated output), dense or with experts
-    /// and a shared expert
-    static let modelTypes: Set<String> = ["llama", "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"]
+    /// and a shared expert, and Nemotron-H's (Mamba-2, attention without RoPE, MLPs and experts:
+    /// NemotronH.swift)
+    static let modelTypes: Set<String> = [
+        "llama", "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe", "nemotron_h",
+    ]
 
     /// How a module's weights are quantized
     struct Quantization {
@@ -40,6 +43,14 @@ enum LlamaShard {
         var linearKeyDim = 0
         var linearValueDim = 0
         var convKernel = 4
+        // Nemotron-H: Mamba-2, and its experts' routing
+        var mambaHeads = 0
+        var mambaHeadDim = 0
+        var mambaGroups = 0
+        var ssmStateSize = 0
+        var timeStepLimit: (Float, Float) = (0, .infinity)
+        var routedScalingFactor: Float = 1
+        var expertGroups = 1
 
         init() {}
 
@@ -50,14 +61,24 @@ enum LlamaShard {
             heads = int("num_attention_heads") ?? heads
             kvHeads = int("num_key_value_heads") ?? heads
             headDim = int("head_dim") ?? hiddenSize / heads
-            normEpsilon = (json["rms_norm_eps"] as? NSNumber)?.floatValue ?? normEpsilon
+            normEpsilon = (json["rms_norm_eps"] as? NSNumber)?.floatValue
+                ?? (json["layer_norm_epsilon"] as? NSNumber)?.floatValue ?? normEpsilon
             expertsPerToken = int("num_experts_per_tok") ?? 0
             normalizeExpertScores = (json["norm_topk_prob"] as? NSNumber)?.boolValue ?? false
             linearKeyHeads = int("linear_num_key_heads") ?? 0
             linearValueHeads = int("linear_num_value_heads") ?? 0
             linearKeyDim = int("linear_key_head_dim") ?? 0
             linearValueDim = int("linear_value_head_dim") ?? 0
-            convKernel = int("linear_conv_kernel_dim") ?? convKernel
+            convKernel = int("linear_conv_kernel_dim") ?? int("conv_kernel") ?? convKernel
+            mambaHeads = int("mamba_num_heads") ?? 0
+            mambaHeadDim = int("mamba_head_dim") ?? 0
+            mambaGroups = int("n_groups") ?? 0
+            ssmStateSize = int("ssm_state_size") ?? 0
+            if let limit = json["time_step_limit"] as? [NSNumber], limit.count == 2 {
+                timeStepLimit = (limit[0].floatValue, limit[1].floatValue)
+            }
+            routedScalingFactor = (json["routed_scaling_factor"] as? NSNumber)?.floatValue ?? 1
+            expertGroups = int("n_group") ?? 1
             func parsed(_ entry: [String: Any], else fallback: Quantization) -> Quantization {
                 Quantization(
                     groupSize: (entry["group_size"] as? NSNumber)?.intValue ?? fallback.groupSize,
@@ -85,8 +106,21 @@ enum LlamaShard {
             return array
         }
 
-        /// A linear attention layer (Qwen3.5), which keeps a recurrent state, not keys and values
-        var isLinear: Bool { weights["linear_attn.A_log"] != nil }
+        /// A layer that keeps a recurrent state, not keys and values: Qwen3.5's linear attention,
+        /// Nemotron-H's Mamba-2
+        var isLinear: Bool { weights["linear_attn.A_log"] != nil || weights["mixer.A_log"] != nil }
+
+        /// A Nemotron-H block's kind, by its weights (nil: another model's layer)
+        var nemotronBlock: NemotronBlock? {
+            if weights["mixer.A_log"] != nil { return .mamba }
+            if weights["mixer.q_proj.weight"] != nil { return .attention }
+            if weights["mixer.gate.weight"] != nil { return .experts }
+            if weights["mixer.up_proj.weight"] != nil { return .mlp }
+            return nil
+        }
+
+        /// Whether the model keeps a cache for this layer: not for Nemotron-H's MLP and experts
+        var hasCache: Bool { nemotronBlock != .mlp && nemotronBlock != .experts }
 
         func quantization(of module: String) -> Quantization {
             quantization[module] ?? config.quantization
@@ -355,12 +389,26 @@ enum LlamaShard {
     static func forward<Cache: LayerCache>(
         _ x: MLXArray, layer: Layer, cache: inout Cache, ropeFrequencies: MLXArray
     ) -> MLXArray {
-        block(x, layer: layer) { attention($0, layer: layer, cache: &cache, ropeFrequencies: ropeFrequencies) }
+        if layer.nemotronBlock == .attention {
+            return nemotronBlock(x, layer: layer) { nemotronAttention($0, layer: layer, cache: &cache) }
+        }
+        return block(x, layer: layer) { attention($0, layer: layer, cache: &cache, ropeFrequencies: ropeFrequencies) }
     }
 
-    /// A linear attention layer, given its cache
+    /// A layer with a recurrent state (linear attention, Mamba-2), given its cache
     static func forward(_ x: MLXArray, layer: Layer, cache: inout RecurrentCache) -> MLXArray {
-        block(x, layer: layer) { linearAttention($0, layer: layer, cache: &cache) }
+        if layer.nemotronBlock == .mamba {
+            return nemotronBlock(x, layer: layer) { mamba2($0, layer: layer, cache: &cache) }
+        }
+        return block(x, layer: layer) { linearAttention($0, layer: layer, cache: &cache) }
+    }
+
+    /// A layer without a cache: Nemotron-H's MLP or experts
+    static func forward(_ x: MLXArray, layer: Layer) -> MLXArray {
+        nemotronBlock(x, layer: layer) {
+            layer.nemotronBlock == .experts
+                ? nemotronExperts($0, layer: layer) : nemotronMLP($0, layer: layer, prefix: "mixer")
+        }
     }
 
     /// A decoder layer around its attention (`mix`): normed, mixed, then its MLP or experts
