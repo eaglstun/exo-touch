@@ -1,12 +1,15 @@
 import Foundation
 import MLX
+import os
 
 /// exo's remote stage, served from this iPad: the Swift twin of
 /// exo/src/exo/worker/engines/mlx/remote_stage/server.py, speaking protocol.py's frames.
-/// A node connects, sends hidden states for this stage's layers and keeps their KV caches
-/// here, named by handles it picks.
+/// A node connects, sends this stage's layers a layer at a time, then hidden states for them,
+/// and keeps their KV caches here, named by handles it picks. Each connection has its own
+/// thread, layers and caches: a proxy node asks for this device's memory on a connection of
+/// its own while its runner's is busy.
 enum RemoteStageServer {
-    static let protocolVersion = 2
+    static let protocolVersion = 3
 
     /// protocol.py's Frame: every field, snake_case on the wire
     struct Frame: Codable {
@@ -18,6 +21,9 @@ enum RemoteStageServer {
         var dtype = ""
         var payloadBytes = 0
         var protocolVersion = 0
+        var deviceModel = ""
+        var memoryTotal = 0
+        var memoryAvailable = 0
         var configJson = ""
         var layerCount = 0
         var kvBytesPerToken = 0
@@ -27,9 +33,9 @@ enum RemoteStageServer {
 
     struct ConnectionClosed: Error {}
 
-    /// Serve nodes one at a time on `port`. A node sends the layers it wants run in `load`.
-    static func serve(port: UInt16, log: @escaping (String) -> Void) throws {
-        var started = Date()
+    /// Serve nodes on `port`, each connection on its own thread. A node sends the layers it
+    /// wants run in `load` frames.
+    static func serve(port: UInt16, log: @escaping @Sendable (String) -> Void) throws {
         let listener = socket(AF_INET, SOCK_STREAM, 0)
         var yes: Int32 = 1
         setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
@@ -43,7 +49,7 @@ enum RemoteStageServer {
                 bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard bound == 0, listen(listener, 1) == 0 else {
+        guard bound == 0, listen(listener, 8) == 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
         log("stage listening on port \(port)")
@@ -52,14 +58,35 @@ enum RemoteStageServer {
             let connection = accept(listener, nil, nil)
             guard connection >= 0 else { continue }
             setsockopt(connection, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
-            log("node connected")
-            started = Date()
-            let (forwards, handles) = serveConnection(connection, log: log)
-            close(connection)
-            log(String(
-                format: "node disconnected after %.1fs: %d forwards, dropped %d caches",
-                Date().timeIntervalSince(started), forwards, handles))
+            Thread {
+                let started = Date()
+                let (forwards, handles) = serveConnection(connection, log: log)
+                close(connection)
+                // A memory poll says hello and goes: log only connections that did something
+                if forwards > 0 || handles > 0 {
+                    log(String(
+                        format: "node disconnected after %.1fs: %d forwards, dropped %d caches",
+                        Date().timeIntervalSince(started), forwards, handles))
+                }
+            }.start()
         }
+    }
+
+    /// This device's model identifier (e.g. iPad17,1)
+    static func deviceModel() -> String {
+        var system = utsname()
+        uname(&system)
+        return withUnsafeBytes(of: system.machine) { bytes in
+            String(decoding: bytes.prefix(while: { $0 != 0 }), as: UTF8.self)
+        }
+    }
+
+    static func welcome() -> Frame {
+        Frame(
+            operation: "welcome", protocolVersion: protocolVersion, deviceModel: deviceModel(),
+            memoryTotal: Int(ProcessInfo.processInfo.physicalMemory),
+            // What this app can still allocate before iPadOS ends it: the memory a model may use
+            memoryAvailable: Int(os_proc_available_memory()))
     }
 
     /// Serves one node until it disconnects. Returns the forwards run and the caches dropped.
@@ -69,6 +96,10 @@ enum RemoteStageServer {
         var layers: [LlamaShard.Layer] = []
         var ropeFrequencies = MLXArray(0)
         var kvBytesPerToken = 0
+        // The layers a load has sent so far, and how many it will send
+        var arriving: [String: MLXArray] = [:]
+        var expectedLayers = 0
+        var loadStarted = Date()
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let encoder = JSONEncoder()
@@ -95,23 +126,40 @@ enum RemoteStageServer {
 
                 switch frame.operation {
                 case "hello":
-                    try send(Frame(operation: "welcome", protocolVersion: protocolVersion))
+                    try send(welcome())
                 case "load":
-                    let started = Date()
-                    let json = try JSONSerialization.jsonObject(with: Data(frame.configJson.utf8))
-                    let config = LlamaShard.Config(json: json as? [String: Any] ?? [:])
-                    caches.removeAll()
-                    (layers, ropeFrequencies) = try LlamaShard.loadLayers(
-                        arrays: try loadArrays(data: payload), config: config)
-                    // Keys and values per token: layers x 2 x kv heads x head dim, in the
-                    // activations' dtype
-                    let itemSize = layers.first?.weights["input_layernorm.weight"]?.itemSize ?? 2
-                    kvBytesPerToken = layers.count * 2 * config.kvHeads * config.headDim * itemSize
-                    log(String(
-                        format: "loaded %d layers (%.0f MB) in %.2fs", layers.count,
-                        Double(payload.count) / 1e6, Date().timeIntervalSince(started)))
+                    if frame.offset == 0 {
+                        caches.removeAll()
+                        layers = []
+                        arriving = [:]
+                        expectedLayers = frame.layerCount
+                        loadStarted = Date()
+                    }
+                    let weights = try loadArrays(data: payload)
+                    // Read now, so the frame's bytes can go
+                    eval(Array(weights.values))
+                    arriving.merge(weights) { _, new in new }
+                    let received = Set(arriving.keys.compactMap { name -> Substring? in
+                        let parts = name.split(separator: ".")
+                        return parts.first == "layers" && parts.count > 1 ? parts[1] : nil
+                    }).count
+                    if received == expectedLayers {
+                        let json = try JSONSerialization.jsonObject(with: Data(frame.configJson.utf8))
+                        let config = LlamaShard.Config(json: json as? [String: Any] ?? [:])
+                        (layers, ropeFrequencies) = try LlamaShard.loadLayers(arrays: arriving, config: config)
+                        arriving = [:]
+                        // Keys and values per token: layers x 2 x kv heads x head dim, in the
+                        // activations' dtype
+                        let itemSize = layers.first?.weights["input_layernorm.weight"]?.itemSize ?? 2
+                        kvBytesPerToken = layers.count * 2 * config.kvHeads * config.headDim * itemSize
+                        log(String(
+                            format: "loaded %d layers in %.2fs; %.0f MB left to this app",
+                            layers.count, Date().timeIntervalSince(loadStarted),
+                            Double(os_proc_available_memory()) / 1e6))
+                    }
                     try send(Frame(
-                        operation: "loaded", layerCount: layers.count, kvBytesPerToken: kvBytesPerToken))
+                        operation: "loaded", layerCount: received,
+                        kvBytesPerToken: layers.isEmpty ? 0 : kvBytesPerToken))
                 case "new":
                     if !layers.isEmpty {
                         caches[frame.handle] = Array(repeating: LlamaShard.KVCache(), count: layers.count)
