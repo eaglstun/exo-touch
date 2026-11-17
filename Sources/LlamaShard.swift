@@ -9,8 +9,9 @@ import MLX
 enum LlamaShard {
     /// The model types whose layers this stage runs: Llama's, Qwen3's (which also norms each
     /// head's queries and keys), Qwen3's mixture of experts, and Qwen3.5's (linear attention
-    /// layers with a recurrent state, and attention with a gated output)
-    static let modelTypes: Set<String> = ["llama", "qwen3", "qwen3_moe", "qwen3_5"]
+    /// layers with a recurrent state, and attention with a gated output), dense or with experts
+    /// and a shared expert
+    static let modelTypes: Set<String> = ["llama", "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"]
 
     /// How a module's weights are quantized
     struct Quantization {
@@ -520,7 +521,14 @@ enum LlamaShard {
         }
         // [B, L, k, D], weighed by score and summed over the k experts
         projected = projected.squeezed(axis: -2)
-        return (projected * expandedDimensions(scores, axis: -1)).sum(axis: -2).asType(projected.dtype)
+        let routed = (projected * expandedDimensions(scores, axis: -1)).sum(axis: -2).asType(projected.dtype)
+        // Qwen3.5's shared expert (Qwen3NextSparseMoeBlock): an MLP every token goes through,
+        // weighed by its own gate
+        guard layer.weights["mlp.shared_expert.gate_proj.weight"] != nil else { return routed }
+        let sharedGate = layer.linear(x, "mlp.shared_expert.gate_proj")
+        let shared = layer.linear(sharedGate * sigmoid(sharedGate) * layer.linear(x, "mlp.shared_expert.up_proj"),
+            "mlp.shared_expert.down_proj")
+        return routed + sigmoid(layer.linear(x, "mlp.shared_expert_gate")) * shared
     }
 
     static func run(rank: Int, hostfileJSON: String, shard: URL, log: @escaping (String) -> Void) throws {
