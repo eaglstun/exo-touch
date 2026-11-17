@@ -162,6 +162,14 @@ enum RemoteStageServer {
                 case "hello":
                     try send(welcome())
                 case "load":
+                    let json = try JSONSerialization.jsonObject(with: Data(frame.configJson.utf8))
+                    let config = LlamaShard.Config(json: json as? [String: Any] ?? [:])
+                    guard LlamaShard.modelTypes.contains(config.modelType) else {
+                        try send(Frame(
+                            operation: "error",
+                            message: "this stage can't run \(config.modelType) layers"))
+                        continue
+                    }
                     if frame.offset == 0 {
                         caches.removeAll()
                         layers = []
@@ -178,8 +186,6 @@ enum RemoteStageServer {
                         return parts.first == "layers" && parts.count > 1 ? parts[1] : nil
                     }).count
                     if received == expectedLayers {
-                        let json = try JSONSerialization.jsonObject(with: Data(frame.configJson.utf8))
-                        let config = LlamaShard.Config(json: json as? [String: Any] ?? [:])
                         (layers, ropeFrequencies) = try LlamaShard.loadLayers(arrays: arriving, config: config)
                         arriving = [:]
                         // Keys and values per token: layers x 2 x kv heads x head dim, in the

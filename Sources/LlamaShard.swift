@@ -1,33 +1,62 @@
 import Foundation
 import MLX
 
-/// The iPad's stage of a two-stage Llama-3.2-1B pipeline: the last layers, on this
+/// The layers a stage runs: Llama's, Qwen3's and Qwen3's mixture of experts (see modelTypes).
+/// Also the iPad's stage of a two-stage Llama-3.2-1B ring pipeline: the last layers, on this
 /// device's GPU. Rank 0 (mac/llama_split.py) sends an int32 [L] header and a
 /// [1, L, 2048] float16 hidden state per step; this runs its layers with a KV cache and
 /// sends the result back. A header of 0 ends the run.
 enum LlamaShard {
-    /// A Llama model's shape: Llama-3.2-1B-Instruct-4bit by default, else from its config.json
+    /// The model types whose layers this stage runs: Llama's, Qwen3's (which also norms each
+    /// head's queries and keys), and Qwen3's mixture of experts
+    static let modelTypes: Set<String> = ["llama", "qwen3", "qwen3_moe"]
+
+    /// How a module's weights are quantized
+    struct Quantization {
+        var groupSize = 64
+        var bits = 4
+    }
+
+    /// A model's shape: Llama-3.2-1B-Instruct-4bit by default, else from its config.json
     struct Config {
+        var modelType = "llama"
         var hiddenSize = 2048
         var heads = 32
         var kvHeads = 8
         var headDim = 64
         var normEpsilon: Float = 1e-5
-        var groupSize = 64
-        var bits = 4
+        var quantization = Quantization()
+        /// By the stage's name of a module (layers.<i>.<path>), when it differs from the rest:
+        /// e.g. a mixture of experts' router at 8 bits. The node says (stage_quantization).
+        var moduleQuantization: [String: Quantization] = [:]
+        // A mixture of experts
+        var expertsPerToken = 0
+        var normalizeExpertScores = false
 
         init() {}
 
         init(json: [String: Any]) {
             func int(_ key: String) -> Int? { (json[key] as? NSNumber)?.intValue }
+            modelType = json["model_type"] as? String ?? modelType
             hiddenSize = int("hidden_size") ?? hiddenSize
             heads = int("num_attention_heads") ?? heads
             kvHeads = int("num_key_value_heads") ?? heads
             headDim = int("head_dim") ?? hiddenSize / heads
             normEpsilon = (json["rms_norm_eps"] as? NSNumber)?.floatValue ?? normEpsilon
-            if let quantization = json["quantization"] as? [String: Any] {
-                groupSize = (quantization["group_size"] as? NSNumber)?.intValue ?? groupSize
-                bits = (quantization["bits"] as? NSNumber)?.intValue ?? bits
+            expertsPerToken = int("num_experts_per_tok") ?? 0
+            normalizeExpertScores = (json["norm_topk_prob"] as? NSNumber)?.boolValue ?? false
+            func parsed(_ entry: [String: Any], else fallback: Quantization) -> Quantization {
+                Quantization(
+                    groupSize: (entry["group_size"] as? NSNumber)?.intValue ?? fallback.groupSize,
+                    bits: (entry["bits"] as? NSNumber)?.intValue ?? fallback.bits)
+            }
+            if let entries = json["quantization"] as? [String: Any] {
+                quantization = parsed(entries, else: quantization)
+                for (path, entry) in entries {
+                    if let entry = entry as? [String: Any] {
+                        moduleQuantization[path] = parsed(entry, else: quantization)
+                    }
+                }
             }
         }
     }
@@ -35,17 +64,34 @@ enum LlamaShard {
     struct Layer {
         let weights: [String: MLXArray]
         var config = Config()
+        /// By the module's path in this layer, where it differs from config.quantization
+        var quantization: [String: Quantization] = [:]
 
         func weight(_ name: String) -> MLXArray {
             guard let array = weights[name] else { fatalError("missing weight \(name)") }
             return array
         }
 
+        func quantization(of module: String) -> Quantization {
+            quantization[module] ?? config.quantization
+        }
+
         func linear(_ x: MLXArray, _ name: String) -> MLXArray {
-            quantizedMatmul(
+            let quantization = quantization(of: name)
+            return quantizedMatmul(
                 x, weight(name + ".weight"), scales: weight(name + ".scales"),
                 biases: weight(name + ".biases"), transpose: true,
-                groupSize: config.groupSize, bits: config.bits)
+                groupSize: quantization.groupSize, bits: quantization.bits)
+        }
+
+        /// One expert's projection of each row, by `experts` (the expert of each row)
+        func expertLinear(_ x: MLXArray, _ name: String, experts: MLXArray, sorted: Bool) -> MLXArray {
+            let quantization = quantization(of: name)
+            return gatherQuantizedMM(
+                x, weight(name + ".weight"), scales: weight(name + ".scales"),
+                biases: weight(name + ".biases"), rhsIndices: experts, transpose: true,
+                groupSize: quantization.groupSize, bits: quantization.bits,
+                sortedIndices: sorted)
         }
     }
 
@@ -274,9 +320,14 @@ enum LlamaShard {
             let prefix = "layers.\(layers.count)."
             let layerWeights = arrays.filter { $0.key.hasPrefix(prefix) }
             if layerWeights.isEmpty { break }
-            layers.append(Layer(weights: Dictionary(uniqueKeysWithValues: layerWeights.map {
-                (String($0.key.dropFirst(prefix.count)), $0.value)
-            }), config: config))
+            func ownNames<Value>(_ entries: [String: Value]) -> [String: Value] {
+                Dictionary(uniqueKeysWithValues: entries.filter { $0.key.hasPrefix(prefix) }.map {
+                    (String($0.key.dropFirst(prefix.count)), $0.value)
+                })
+            }
+            layers.append(Layer(
+                weights: ownNames(layerWeights), config: config,
+                quantization: ownNames(config.moduleQuantization)))
         }
         eval(Array(arrays.values))
         return (layers, ropeFrequencies)
@@ -291,10 +342,17 @@ enum LlamaShard {
         let length = x.dim(1)
 
         let normed = MLXFast.rmsNorm(x, weight: layer.weight("input_layernorm.weight"), eps: normEpsilon)
-        var queries = layer.linear(normed, "self_attn.q_proj")
-            .reshaped(batch, length, heads, headDim).transposed(0, 2, 1, 3)
-        var keys = layer.linear(normed, "self_attn.k_proj")
-            .reshaped(batch, length, kvHeads, headDim).transposed(0, 2, 1, 3)
+        var queries = layer.linear(normed, "self_attn.q_proj").reshaped(batch, length, heads, headDim)
+        var keys = layer.linear(normed, "self_attn.k_proj").reshaped(batch, length, kvHeads, headDim)
+        // Qwen3 norms each head's queries and keys before RoPE
+        if let queryNorm = layer.weights["self_attn.q_norm.weight"],
+            let keyNorm = layer.weights["self_attn.k_norm.weight"]
+        {
+            queries = MLXFast.rmsNorm(queries, weight: queryNorm, eps: normEpsilon)
+            keys = MLXFast.rmsNorm(keys, weight: keyNorm, eps: normEpsilon)
+        }
+        queries = queries.transposed(0, 2, 1, 3)
+        keys = keys.transposed(0, 2, 1, 3)
         var values = layer.linear(normed, "self_attn.v_proj")
             .reshaped(batch, length, kvHeads, headDim).transposed(0, 2, 1, 3)
 
@@ -312,9 +370,48 @@ enum LlamaShard {
 
         let normedAgain = MLXFast.rmsNorm(
             attended, weight: layer.weight("post_attention_layernorm.weight"), eps: normEpsilon)
+        if layer.weights["mlp.switch_mlp.gate_proj.weight"] != nil {
+            return attended + mixtureOfExperts(normedAgain, layer: layer)
+        }
         let gate = layer.linear(normedAgain, "mlp.gate_proj")
         let up = layer.linear(normedAgain, "mlp.up_proj")
         return attended + layer.linear(gate * sigmoid(gate) * up, "mlp.down_proj")
+    }
+
+    /// Qwen3's mixture of experts, as mlx-lm's Qwen3MoeSparseMoeBlock and SwitchGLU compute it:
+    /// each token's top k experts by the router, their outputs weighed by the router's scores
+    static func mixtureOfExperts(_ x: MLXArray, layer: Layer) -> MLXArray {
+        let k = layer.config.expertsPerToken
+        let gates = softmax(layer.linear(x, "mlp.gate"), axis: -1, precise: true)
+        let experts = argPartition(gates, kth: -k, axis: -1)[.ellipsis, (-k)...]
+        var scores = takeAlong(gates, experts, axis: -1)
+        if layer.config.normalizeExpertScores {
+            scores = scores / scores.sum(axis: -1, keepDims: true)
+        }
+
+        // [B, L, 1, 1, D]: one row per token, for each of its experts to project
+        var rows = expandedDimensions(x, axes: [-2, -3])
+        var rowExperts = experts
+        // With many tokens, sorted by expert, so each expert's weights are read once
+        let sorted = experts.size >= 64
+        var inverseOrder: MLXArray? = nil
+        if sorted {
+            let flatExperts = experts.flattened()
+            let order = argSort(flatExperts)
+            inverseOrder = argSort(order)
+            rows = rows.flattened(start: 0, end: -3)[order.floorDivide(k)]
+            rowExperts = flatExperts[order]
+        }
+        let up = layer.expertLinear(rows, "mlp.switch_mlp.up_proj", experts: rowExperts, sorted: sorted)
+        let gate = layer.expertLinear(rows, "mlp.switch_mlp.gate_proj", experts: rowExperts, sorted: sorted)
+        var projected = layer.expertLinear(
+            gate * sigmoid(gate) * up, "mlp.switch_mlp.down_proj", experts: rowExperts, sorted: sorted)
+        if let inverseOrder {
+            projected = unflatten(projected[inverseOrder], axis: 0, shape: experts.shape)
+        }
+        // [B, L, k, D], weighed by score and summed over the k experts
+        projected = projected.squeezed(axis: -2)
+        return (projected * expandedDimensions(scores, axis: -1)).sum(axis: -2).asType(projected.dtype)
     }
 
     static func run(rank: Int, hostfileJSON: String, shard: URL, log: @escaping (String) -> Void) throws {
