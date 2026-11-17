@@ -33,11 +33,39 @@ enum LlamaShard {
     struct KVCache {
         var keys: MLXArray?
         var values: MLXArray?
+
+        /// Tokens held: keys and values are kept at exactly this length
+        var offset: Int { keys?.dim(2) ?? 0 }
+
+        /// Drop every token from `offset` on
+        func truncated(to offset: Int) -> KVCache {
+            guard let keys, let values, offset < self.offset else { return self }
+            if offset == 0 { return KVCache() }
+            return KVCache(keys: keys[.ellipsis, ..<offset, 0...], values: values[.ellipsis, ..<offset, 0...])
+        }
+    }
+
+    /// This stage's layers and the llama3 RoPE frequencies, from a shard made by mac/make_shard.py
+    static func loadLayers(shard: URL) throws -> (layers: [Layer], ropeFrequencies: MLXArray) {
+        let arrays = try loadArrays(url: shard)
+        guard let ropeFrequencies = arrays["rope_freqs"] else { fatalError("shard has no rope_freqs") }
+        var layers: [Layer] = []
+        while true {
+            let prefix = "layers.\(layers.count)."
+            let layerWeights = arrays.filter { $0.key.hasPrefix(prefix) }
+            if layerWeights.isEmpty { break }
+            layers.append(Layer(weights: Dictionary(uniqueKeysWithValues: layerWeights.map {
+                (String($0.key.dropFirst(prefix.count)), $0.value)
+            })))
+        }
+        eval(Array(arrays.values))
+        return (layers, ropeFrequencies)
     }
 
     static func forward(
-        _ x: MLXArray, layer: Layer, cache: inout KVCache, offset: Int, ropeFrequencies: MLXArray
+        _ x: MLXArray, layer: Layer, cache: inout KVCache, ropeFrequencies: MLXArray
     ) -> MLXArray {
+        let offset = cache.offset
         let batch = x.dim(0)
         let length = x.dim(1)
 
@@ -85,19 +113,8 @@ enum LlamaShard {
 
         // Load this stage's layers
         var started = Date()
-        let arrays = try loadArrays(url: shard)
-        guard let ropeFrequencies = arrays["rope_freqs"] else { fatalError("shard has no rope_freqs") }
-        var layers: [Layer] = []
-        while true {
-            let prefix = "layers.\(layers.count)."
-            let layerWeights = arrays.filter { $0.key.hasPrefix(prefix) }
-            if layerWeights.isEmpty { break }
-            layers.append(Layer(weights: Dictionary(uniqueKeysWithValues: layerWeights.map {
-                (String($0.key.dropFirst(prefix.count)), $0.value)
-            })))
-        }
-        eval(Array(arrays.values))
-        log("loaded \(layers.count) layers (\(arrays.count) arrays) in \(seconds(since: started))")
+        let (layers, ropeFrequencies) = try loadLayers(shard: shard)
+        log("loaded \(layers.count) layers in \(seconds(since: started))")
 
         started = Date()
         let group = try MLXDistributed.initialize(backend: .ring, strict: true)
@@ -105,7 +122,6 @@ enum LlamaShard {
         log("joined ring as rank \(try group.rank) of \(try group.size) in \(seconds(since: started))")
 
         var caches = Array(repeating: KVCache(), count: layers.count)
-        var offset = 0
         var steps = 0
         var computeSeconds: Double = 0
         while true {
@@ -119,7 +135,7 @@ enum LlamaShard {
             let computeStarted = Date()
             for index in layers.indices {
                 hidden = forward(
-                    hidden, layer: layers[index], cache: &caches[index], offset: offset,
+                    hidden, layer: layers[index], cache: &caches[index],
                     ropeFrequencies: ropeFrequencies)
             }
             hidden = hidden.asType(.float16)
@@ -128,7 +144,6 @@ enum LlamaShard {
             eval(MLXDistributed.send(hidden, to: peer, group: group))
 
             if steps == 0 { log("prefill: \(length) tokens") }
-            offset += length
             steps += 1
         }
         log(String(

@@ -39,7 +39,8 @@ struct ContentView: View {
         }
         .onAppear {
             // Launched from the Mac with SPIKE_RANK and SPIKE_HOSTFILE_JSON: run at once
-            if ProcessInfo.processInfo.environment["SPIKE_HOSTFILE_JSON"] != nil { start() }
+            let environment = ProcessInfo.processInfo.environment
+            if environment["SPIKE_HOSTFILE_JSON"] != nil || environment["SPIKE_MODE"] == "stage" { start() }
         }
         // The ring needs the app in the foreground: keep the screen on while it runs
         .onChange(of: log.running) { _, running in
@@ -49,6 +50,10 @@ struct ContentView: View {
 
     private func start() {
         let environment = ProcessInfo.processInfo.environment
+        if environment["SPIKE_MODE"] == "stage" {
+            startStage(port: UInt16(environment["SPIKE_PORT"] ?? "") ?? 5560)
+            return
+        }
         guard let hostfile = environment["SPIKE_HOSTFILE_JSON"] else {
             log.add("No SPIKE_HOSTFILE_JSON: launch from the Mac with mac/run_spike.sh")
             return
@@ -66,6 +71,24 @@ struct ContentView: View {
                     try LlamaShard.run(rank: rank, hostfileJSON: hostfile, shard: shard, log: add)
                 } else {
                     try RingSpike.run(rank: rank, hostfileJSON: hostfile, log: add)
+                }
+            } catch {
+                Task { @MainActor in log.add("FAILED: \(error)") }
+            }
+            Task { @MainActor in log.running = false }
+        }
+    }
+
+    /// Serve exo's remote stage protocol on `port` until the app quits
+    private func startStage(port: UInt16) {
+        let shard = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ipad_shard.safetensors")
+        log.running = true
+        let log = self.log
+        Task.detached {
+            do {
+                try RemoteStageServer.serve(port: port, shard: shard) { line in
+                    Task { @MainActor in log.add(line) }
                 }
             } catch {
                 Task { @MainActor in log.add("FAILED: \(error)") }
