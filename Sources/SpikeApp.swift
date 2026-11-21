@@ -40,7 +40,7 @@ struct ContentView: View {
         .onAppear {
             // Launched from the Mac with SPIKE_RANK and SPIKE_HOSTFILE_JSON: run at once
             let environment = ProcessInfo.processInfo.environment
-            if environment["SPIKE_HOSTFILE_JSON"] != nil || ["stage", "dit", "ditblock"].contains(environment["SPIKE_MODE"]) {
+            if environment["SPIKE_HOSTFILE_JSON"] != nil || ["stage", "dit", "ditblock", "split"].contains(environment["SPIKE_MODE"]) {
                 start()
             }
         }
@@ -54,6 +54,21 @@ struct ContentView: View {
         let environment = ProcessInfo.processInfo.environment
         if environment["SPIKE_MODE"] == "stage" {
             startStage(port: UInt16(environment["SPIKE_PORT"] ?? "") ?? 5560)
+            return
+        }
+        if environment["SPIKE_MODE"] == "split" {
+            // A share of FastFrames-LingBot's DiT tokens, in step with the Mac (lingbot_ipad_split.py)
+            log.running = true
+            let log = self.log
+            let port = UInt16(environment["SPIKE_PORT"] ?? "") ?? SplitStage.defaultPort
+            Task.detached {
+                do {
+                    try SplitStage.serve(port: port) { line in Task { @MainActor in log.add(line) } }
+                } catch {
+                    Task { @MainActor in log.add("FAILED: \(error)") }
+                }
+                Task { @MainActor in log.running = false }
+            }
             return
         }
         if environment["SPIKE_MODE"] == "ditblock" {

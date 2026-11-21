@@ -64,3 +64,21 @@ dtype rules as `scripts/lingbot_block_mlx.py` and compares. At 832x464:
 | iPad Pro M5, MLX-Swift compiled | 1.2e-3 | 156.8 ms |
 
 The iPad runs the real block at 92% of the Mac's speed (compiled; `compile` is worth 1.34x here).
+
+## 5. A LingBot DiT pass split with the Mac: `mac/run_split_stage.sh`
+
+`Sources/SplitStage.swift` (`SPIKE_MODE=split`, port 5570) runs a share of one denoising pass's
+tokens through all 30 blocks, in step with fastframes' `scripts/lingbot_ipad_split.py` on the Mac:
+in each block both sides send their tokens' keys and values, write both into their own KV cache,
+and attend over all of it. Setup sends the weights, caches, text K/V and camera rows once (8.1 GB
+in 11 s; the app's footprint is then 8.3 GB). While waiting for the Mac's K/V the GPU stays busy,
+so it doesn't clock down. One pass at 832x464, 55% of the tokens here:
+
+| | per pass |
+|---|---|
+| M4 Max alone (PyTorch MPS), quiet | 4.53 s |
+| split with this iPad | 3.14-3.25 s (~1.4x) |
+| M4 Max alone while Photos analyses media | ~7.8 s |
+| split, same moment | ~3.7 s (~2.1x) |
+
+The split pass matches the Mac alone to 4.9e-3 relative L2.
