@@ -46,3 +46,21 @@ runs the same shapes with `scripts/bench_dit_block.py` in fastframes (branch `ip
 The M5's GEMMs run at 10.7-13.6 TFLOPS and its attention at 9.9-11.1, close to the M4 Max
 (12.7-14.8 and 10.5-12.5). The link is the limit: the iPad joins the Mac as a USB device at
 10 Gb/s (858 MB/s, 0.29 ms round trip), not over Thunderbolt networking, whatever the cable.
+
+The synthetic block above concatenates the KV cache every time, which the real DiT doesn't (it
+writes this chunk's rows in place), so those whole-block times run high on both devices.
+
+## 4. The real block: `mac/run_dit_block.sh <capture>`
+
+fastframes' `scripts/lingbot_block_capture.py` saves LingBot's real DiT block 0 (weights, inputs and
+PyTorch's output) during a full-cache chunk; `Sources/DiTBlockCheck.swift` runs it here with the same
+dtype rules as `scripts/lingbot_block_mlx.py` and compares. At 832x464:
+
+| | output vs PyTorch (relative L2) | per block |
+|---|---|---|
+| M4 Max, PyTorch MPS (the demo) | reference | 144.1 ms |
+| M4 Max, MLX compiled | 8.4e-4 | 127.4 ms |
+| iPad Pro M5, MLX-Swift eager | 1.2e-3 | 209.7 ms |
+| iPad Pro M5, MLX-Swift compiled | 1.2e-3 | 156.8 ms |
+
+The iPad runs the real block at 92% of the Mac's speed (compiled; `compile` is worth 1.34x here).
