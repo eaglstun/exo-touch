@@ -72,6 +72,37 @@ The Mac runs the embedding, layers 0-7 and sampling. The iPad runs layers 8-15 (
 Greedy tokens are identical to the Mac running the whole model alone.
 Decode: 168 tok/s split vs 400 tok/s on the Mac alone. Benchmark Release builds only: Debug compiles MLX at -O0.
 
+## 2b. exo's remote stage: `mac/run_stage.sh`
+
+`Sources/RemoteStageServer.swift` (`SPIKE_MODE=stage`, port 5560) serves the remote stage protocol of the
+exo fork (`src/exo/worker/engines/mlx/remote_stage/`): an exo node hands a range of its layers to this
+iPad, which runs them with their caches (`Sources/LlamaShard.swift`, `Sources/NemotronH.swift`,
+`Sources/LinearAttention.swift`). It runs Llama, Qwen3, Qwen3 MoE, Qwen3.5 (linear attention, MoE) and
+Nemotron-H layers, 4- and 8-bit affine-quantized or unquantized (bf16: plain matmuls where a layer has
+no scales). exo's own tests run against it:
+
+    mac/run_stage.sh
+    cd ../exo && EXO_REMOTE_STAGE=<ipad address>:5560 .venv/bin/python -m pytest \
+      src/exo/worker/engines/mlx/remote_stage/tests/test_remote_stage.py -m ""
+
+They pass for Llama-3.2-1B, Qwen3-0.6B, Qwen3.5-2B-8bit, Qwen3.5-0.8B-bf16 and Nemotron-Nano-9B (15
+tests: generation token for token against the whole model, a batch, and the stage's output against
+the model's own layers).
+
+**Keeping the GPU warm.** Between one decode forward and the next the node runs its own layers, ~5-10
+ms in which an idle iPad GPU clocks down. For 250 ms after each forward the stage keeps it busy with
+throwaway matmuls until the next frame arrives, then goes quiet (`STAGE_KEEP_WARM=0` turns this off).
+Decode through exo's generator, the stage on the USB link:
+
+| model (layers on the iPad) | warm | idle | |
+|---|---|---|---|
+| Llama-3.2-1B-Instruct-4bit (8-16) | ~120 tok/s | ~76 tok/s | 1.57x |
+| Nemotron-3-Nano-30B-A3B-4bit (40-48) | ~80 tok/s | ~55 tok/s | 1.43x |
+
+A forward's GPU time on the iPad is 2.7 ms warm and ~7 ms idle (`STAGE_TIMING=1` logs build, eval and
+copy every 100 decode forwards). Unlike the DiT split (section 5), decode is light enough not to
+throttle: 96 s of back-to-back requests held ~79 tok/s on Nemotron-30B.
+
 ## 3. FastFrames-LingBot DiT block: `mac/run_dit_bench.sh`
 
 `SPIKE_MODE=dit` times one Wan 2.1 1.3B DiT block at the shapes of a FastFrames-LingBot demo chunk
