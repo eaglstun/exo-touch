@@ -28,6 +28,7 @@ enum SplitStage {
         var layer = 0
         var meta: [String: Any] = [:]
         var arrays: [String: MLXArray] = [:]
+        var arrived: UInt64 = 0  // when its last byte was read (uptime ns)
     }
 
     struct Failure: Error, CustomStringConvertible {
@@ -137,12 +138,13 @@ enum SplitStage {
 
     // MARK: frames
 
-    static func itemSize(_ dtype: DType) -> Int { dtype == .float32 ? 4 : 2 }
+    static func itemSize(_ dtype: DType) -> Int { dtype == .float32 ? 4 : dtype == .int8 ? 1 : 2 }
 
     static func dtypeName(_ dtype: DType) -> String {
         switch dtype {
         case .float32: "float32"
         case .float16: "float16"
+        case .int8: "int8"
         default: "bfloat16"
         }
     }
@@ -157,26 +159,36 @@ enum SplitStage {
                               meta: header["meta"] as? [String: Any] ?? [:])
         for spec in header["arrays"] as? [[String: Any]] ?? [] {
             let shape = spec["shape"] as! [Int]
-            let dtype = RemoteStageServer.dtype(named: spec["dtype"] as! String)!
+            let name = spec["dtype"] as! String
+            let dtype = name == "int8" ? DType.int8 : RemoteStageServer.dtype(named: name)!
             message.arrays[spec["name"] as! String] = MLXArray(
                 try RemoteStageServer.readExactly(connection, shape.reduce(1, *) * itemSize(dtype)), shape, dtype: dtype)
         }
+        message.arrived = DispatchTime.now().uptimeNanoseconds
         return message
     }
 
     /// Diagnostics: SPIKE_NO_WARM=1 leaves the GPU idle while a pass waits for the Mac's keys and values
     static let keepsWarm = ProcessInfo.processInfo.environment["SPIKE_NO_WARM"] != "1"
 
-    /// Header and bytes of `arrays` (evaluated): built on the compute thread, written by the sender
-    static func encode(op: String, layer: Int = 0, meta: [String: Any] = [:], arrays: [(String, MLXArray)]) -> Data {
+    /// A frame to send: its header, then its arrays' bytes in order
+    struct Frame {
+        let header: Data
+        let arrays: [MLXArray]  // kept alive until written: `bytes` may point into their memory
+        let bytes: [Data]
+    }
+
+    /// Header and bytes of `arrays` (evaluated). A contiguous array's bytes are read in place by the sender
+    /// (a K/V frame is 10-25 MB: copying it into one Data cost two copies on this thread)
+    static func encode(op: String, layer: Int = 0, meta: [String: Any] = [:], arrays: [(String, MLXArray)]) -> Frame {
         let specs = arrays.map { ["name": $0.0, "shape": $0.1.shape, "dtype": dtypeName($0.1.dtype)] as [String: Any] }
-        let header = try! JSONSerialization.data(
+        let json = try! JSONSerialization.data(
             withJSONObject: ["op": op, "layer": layer, "meta": meta, "arrays": specs] as [String: Any])
-        var length = UInt32(header.count).littleEndian
-        var data = Data(bytes: &length, count: 4)
-        data.append(header)
-        for (_, array) in arrays { data.append(array.asData(access: .copy).data) }
-        return data
+        var length = UInt32(json.count).littleEndian
+        var header = Data(bytes: &length, count: 4)
+        header.append(json)
+        return Frame(header: header, arrays: arrays.map(\.1),
+                     bytes: arrays.map { $0.1.asData(access: .noCopyIfContiguous).data })
     }
 
     // MARK: a session
@@ -204,9 +216,13 @@ enum SplitStage {
             self.log = log
         }
 
-        func send(_ data: Data) {
+        func send(_ frame: Frame) {
             let connection = connection
-            sender.async { try? RemoteStageServer.writeAll(connection, data) }
+            sender.async {
+                try? RemoteStageServer.writeAll(connection, frame.header)
+                for bytes in frame.bytes { try? RemoteStageServer.writeAll(connection, bytes) }
+                withExtendedLifetime(frame.arrays) {}
+            }
         }
 
         func run() throws {
@@ -342,6 +358,11 @@ enum SplitStage {
         var pre: (([MLXArray]) -> [MLXArray])!
         var post: (([MLXArray]) -> [MLXArray])!
         var rotate: (([MLXArray]) -> [MLXArray])!
+        var attend: (([MLXArray]) -> [MLXArray])!
+        var attendLSE: (([MLXArray]) -> [MLXArray])!
+        var merge: (([MLXArray]) -> [MLXArray])!
+        var quantize: (([MLXArray]) -> [MLXArray])!
+        var dequantize: (([MLXArray]) -> [MLXArray])!
 
         func compileBlocks(dim: Int) {
             let heads = heads, d = dim / heads, eps = eps, attnEps = attnEps
@@ -370,6 +391,13 @@ enum SplitStage {
                     scale: scale, mask: nil
                 ).transposed(0, 2, 1, 3)
             }
+            // Attention over one part of the keys, with each row's log-sum-exp for merging: [1, L, H, D], [1, L, H, 1]
+            func attentionLSE(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray) -> [MLXArray] {
+                let (out, lse) = MLXFast.scaledDotProductAttentionWithLSE(
+                    queries: q.transposed(0, 2, 1, 3), keys: k.transposed(0, 2, 1, 3), values: v.transposed(0, 2, 1, 3),
+                    scale: scale)
+                return [out.transposed(0, 2, 1, 3), lse.transposed(0, 2, 1, 3)]
+            }
             func modulation(_ m: MLXArray, _ timeE0: MLXArray) -> [MLXArray] {
                 split(m.expandedDimensions(axis: 0) + timeE0, parts: 6, axis: 2).map { $0.squeezed(axis: 2) }
             }
@@ -386,22 +414,43 @@ enum SplitStage {
             }
             // [canonical key, rope rows] -> [physical key]
             rotate = compile { a in [ropeReal(a[0], a[1])] }
-            // [value, modulation, time_e0, query, cache_k, cache_v, o_w, o_b, cam, norm3_w, norm3_b, cq_w, cq_b,
+            // [query, keys, values] -> [attended]; with LSE -> [attended, log-sum-exp]
+            attend = compile { a in [attention(a[0], a[1], a[2])] }
+            attendLSE = compile { a in attentionLSE(a[0], a[1], a[2]) }
+            // [out A, lse A, out B, lse B] -> [attention over A and B]: each part weighted by its share of
+            // the softmax denominator
+            merge = compile { a in
+                let lse = logAddExp(a[1], a[3])
+                return [(a[0].asType(.float32) * exp(a[1] - lse) + a[2].asType(.float32) * exp(a[3] - lse))
+                    .asType(a[0].dtype)]
+            }
+            // 8-bit K/V for the wire (fastframes' ipad.quantize): each token and head's values as int8 with one
+            // FP32 scale (absmax / 127). [key, value] -> [k int8, k scale, v int8, v scale]
+            quantize = compile { a in
+                a.flatMap { x -> [MLXArray] in
+                    let xf = x.asType(.float32)
+                    let scale = maximum(abs(xf).max(axis: -1, keepDims: true), MLXArray(Float(1e-12))) / 127
+                    return [round(xf / scale).asType(.int8), scale]
+                }
+            }
+            // [int8, scale] -> [bfloat16]
+            dequantize = compile { a in [(a[0].asType(.float32) * a[1]).asType(.bfloat16)] }
+            // [value, modulation, time_e0, attended, o_w, o_b, cam, norm3_w, norm3_b, cq_w, cq_b,
             //  cross_norm_q, co_w, co_b, text_k, text_v, up_w, up_b, down_w, down_b] -> [value]
             post = compile { a in
                 let tokens = a[0].dim(1)
                 let e = modulation(a[1], a[2])
                 var value = a[0]
-                value = value + linear(attention(a[3], a[4], a[5]).reshaped([1, tokens, dim]), a[6], a[7]) * e[2]
-                value = (1.0 + a[8][0]) * value + a[8][1]
-                let q2 = rmsNorm(linear(layerNorm(value, norm3Eps, a[9], a[10]), a[11], a[12]), a[13], crossEps)
-                value = value + linear(attention(q2.reshaped([1, tokens, heads, d]), a[16], a[17])
-                                           .reshaped([1, tokens, dim]), a[14], a[15])
+                value = value + linear(a[3].reshaped([1, tokens, dim]), a[4], a[5]) * e[2]
+                value = (1.0 + a[6][0]) * value + a[6][1]
+                let q2 = rmsNorm(linear(layerNorm(value, norm3Eps, a[7], a[8]), a[9], a[10]), a[11], crossEps)
+                value = value + linear(attention(q2.reshaped([1, tokens, heads, d]), a[14], a[15])
+                                           .reshaped([1, tokens, dim]), a[12], a[13])
                 let hidden = layerNorm(value, eps).asType(.float32) * (1 + e[4]) + e[3]
-                let up = linear(hidden, a[18], a[19]).asType(.float32)
+                let up = linear(hidden, a[16], a[17]).asType(.float32)
                 let gelu = (0.5 * up * (1 + tanh(0.7978845608028654 * (up + 0.044715 * up * up * up))))
                     .asType(.bfloat16)
-                return [value + linear(gelu, a[20], a[21]) * e[5]]
+                return [value + linear(gelu, a[18], a[19]) * e[5]]
             }
         }
 
@@ -414,11 +463,19 @@ enum SplitStage {
             // Diagnostics (mac/split_fake_mac.py): "solo" takes one K/V frame from the Mac and uses it in
             // every block, sending nothing: the pass's GPU work with no traffic or copies beside it
             let solo = message.meta["solo"] as? Bool ?? false
+            // The Mac's choice: attend over the cache's older rows while the K/V are in flight, then over this
+            // chunk's rows, and merge the two (the first chunk has no older rows; an older Mac doesn't ask)
+            let overlap = (message.meta["overlap"] as? Bool ?? false) && rows > 0
+            // The Mac's choice too: this side's K/V cross the link as 8-bit (an older Mac doesn't ask)
+            let kv8 = (message.meta["kv_bits"] as? Int ?? 16) == 8
             var soloKV: Message?
             // An idle GPU clocks down within milliseconds (RemoteStageServer); keep it busy while waiting
             let warmer = MLXRandom.normal([256, 256])
             let began = DispatchTime.now().uptimeNanoseconds
             var waited: UInt64 = 0
+            // From each Mac K/V's arrival to sending this side's next block's: the Mac subtracts it from its
+            // send-to-receive time, leaving the exchange's latency both ways
+            var turn: UInt64 = 0, lastArrived: UInt64 = 0
             var phase = [UInt64](repeating: 0, count: 4)  // pre, own rows, Mac's rows, post (GPU, each evaluated)
             func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
             for i in 0 ..< layerCount {
@@ -426,29 +483,47 @@ enum SplitStage {
                 var t = now()
                 let qkv = pre([value, w["modulation"]!, timeE0, w["qkv_weight"]!, w["qkv_bias"]!, w["norm_q"]!,
                                w["norm_k"]!, ownRope])
-                eval(qkv)
+                let outgoing = kv8 ? quantize([qkv[1], qkv[2]]) : [qkv[1], qkv[2]]
+                eval(qkv + outgoing)
                 phase[0] += now() - t
-                if !solo { send(encode(op: "kv", layer: i, arrays: [("k", qkv[1]), ("v", qkv[2])])) }
+                // Queued now, it runs while the K/V are encoded, sent and the Mac's are in flight
+                let older = overlap ? attendLSE([qkv[0], cacheK[i][0..., ..<rows], cacheV[i][0..., ..<rows]]) : []
+                if overlap { asyncEval(older) }
+                if !solo {
+                    send(encode(op: "kv", layer: i, arrays: kv8
+                        ? [("k", outgoing[0]), ("k_scale", outgoing[1]), ("v", outgoing[2]), ("v_scale", outgoing[3])]
+                        : [("k", outgoing[0]), ("v", outgoing[1])]))
+                }
+                if i > 0 { turn += now() - lastArrived }
                 t = now()
                 cacheK[i][0..., (rows + start) ..< end] = rotate([qkv[1], ownRope])[0]
                 cacheV[i][0..., (rows + start) ..< end] = qkv[2]
                 eval(cacheK[i], cacheV[i])
                 phase[1] += now() - t
                 let waitStart = DispatchTime.now().uptimeNanoseconds
-                let theirs = try soloKV ?? inbox.pop(idle: SplitStage.keepsWarm ? { eval(matmul(warmer, warmer)) } : nil)
+                let keepWarm = SplitStage.keepsWarm && !overlap  // the older rows' attention keeps it busy
+                let theirs = try soloKV ?? inbox.pop(idle: keepWarm ? { eval(matmul(warmer, warmer)) } : nil)
                 if solo { soloKV = theirs }
+                lastArrived = theirs.arrived
                 waited += DispatchTime.now().uptimeNanoseconds - waitStart
                 guard theirs.op == "kv", solo || theirs.layer == i else {
                     throw Failure(description: "expected kv \(i), got \(theirs.op) \(theirs.layer)")
                 }
                 t = now()
-                cacheK[i][0..., rows ..< (rows + start)] = rotate([theirs.arrays["k"]!, macRope])[0]
-                cacheV[i][0..., rows ..< (rows + start)] = theirs.arrays["v"]!
+                var theirK = theirs.arrays["k"]!, theirV = theirs.arrays["v"]!
+                if let kScale = theirs.arrays["k_scale"], let vScale = theirs.arrays["v_scale"] {  // 8-bit
+                    theirK = dequantize([theirK, kScale])[0]
+                    theirV = dequantize([theirV, vScale])[0]
+                }
+                cacheK[i][0..., rows ..< (rows + start)] = rotate([theirK, macRope])[0]
+                cacheV[i][0..., rows ..< (rows + start)] = theirV
                 eval(cacheK[i], cacheV[i])
                 phase[2] += now() - t
                 t = now()
-                let readK = cacheK[i][0..., ..<end], readV = cacheV[i][0..., ..<end]
-                value = post([value, w["modulation"]!, timeE0, qkv[0], readK, readV, w["o_weight"]!, w["o_bias"]!,
+                let attended = overlap
+                    ? merge(older + attendLSE([qkv[0], cacheK[i][0..., rows ..< end], cacheV[i][0..., rows ..< end]]))[0]
+                    : attend([qkv[0], cacheK[i][0..., ..<end], cacheV[i][0..., ..<end]])[0]
+                value = post([value, w["modulation"]!, timeE0, attended, w["o_weight"]!, w["o_bias"]!,
                               camera[i], w["norm3_weight"]!, w["norm3_bias"]!, w["cross_q_weight"]!,
                               w["cross_q_bias"]!, w["cross_norm_q"]!, w["cross_o_weight"]!, w["cross_o_bias"]!,
                               textK[i], textV[i], w["ffn_up_weight"]!, w["ffn_up_bias"]!, w["ffn_down_weight"]!,
@@ -459,7 +534,8 @@ enum SplitStage {
             let ms = Double(DispatchTime.now().uptimeNanoseconds - began) / 1e6
             let waitMs = Double(waited) / 1e6
             let thermal = ["nominal", "fair", "serious", "critical"][ProcessInfo.processInfo.thermalState.rawValue]
-            send(encode(op: "result", meta: ["ms": ms, "wait_ms": waitMs, "thermal": thermal],
+            send(encode(op: "result", meta: ["ms": ms, "wait_ms": waitMs, "thermal": thermal,
+                                             "turn_ms": Double(turn) / 1e6],
                         arrays: [("value", value.asType(.float32))]))
             passes += 1
             log(String(format: "pass %d: %d tokens x %d rows, %.0f ms (pre %.0f, own rows %.0f, Mac rows %.0f, "

@@ -5,6 +5,7 @@ Yes. mlx-swift 0.33.0 pins MLX v0.32.4, the same commit exo runs, so both ranks 
 
 ## Setup
 
+    mac/vendor_mlx_swift.sh    # once: patched mlx-swift 0.33.0 into Vendor/ (see "The patched MLX" below)
     xcodegen generate
     xcodebuild -project ExoIPadSpike.xcodeproj -scheme ExoIPadSpike -configuration Release \
       -destination 'id=<device udid>' -derivedDataPath build -allowProvisioningUpdates build
@@ -12,6 +13,46 @@ Yes. mlx-swift 0.33.0 pins MLX v0.32.4, the same commit exo runs, so both ranks 
 
 On the first run, iOS asks for Local Network access. Until you tap Allow, the ring fails with
 `Couldn't connect (error: 60)`.
+
+### The patched MLX in `Vendor/`
+
+The app builds against a local copy of mlx-swift, not the package from GitHub: `project.yml` points
+`MLXSwift` at `Vendor/mlx-swift`, which git ignores. Run `mac/vendor_mlx_swift.sh` once per checkout
+(it does nothing if `Vendor/mlx-swift` exists). It clones mlx-swift **0.33.0** with its submodules
+(MLX 36969c0, v0.32.4, the commit exo runs; mlx-c v0.8.0) and applies
+`patches/mlx-swift-0.33.0-sdpa-lse.patch`. Without it, `xcodegen`/`xcodebuild` can't find the
+package; with an unpatched copy the build fails on `scaledDotProductAttentionWithLSE`.
+
+**What the patch adds.** MLX's fused attention kernels (including the M5's NAX path) already compute
+each query row's log-sum-exp, but only hand it out while differentiating. The patch exposes it for
+inference, so SplitStage can attend over two sets of keys separately and merge them (section 5):
+
+| layer | file | change |
+|---|---|---|
+| MLX C++ | `Source/Cmlx/mlx/mlx/fast.{h,cpp}` | `fast::scaled_dot_product_attention_lse(q, k, v, scale)` returns `{output, lse}`; lse is `[B, heads, L_q, 1]` float32, natural log. The existing function becomes a thin wrapper over a shared implementation with a `want_lse` flag, so its behaviour is unchanged. Throws if no fused kernel fits the inputs (no fallback). |
+| mlx-c | `Source/Cmlx/mlx-c/mlx/c/fast.{h,cpp}` and the two header copies in `Source/Cmlx/include*/` | `mlx_fast_scaled_dot_product_attention_lse(&res, &lse, q, k, v, scale, stream)` |
+| Swift | `Source/MLX/MLXFast.swift` | `MLXFast.scaledDotProductAttentionWithLSE(queries:keys:values:scale:stream:) -> (output, lse)` |
+
+Unmasked attention only, which is all the split needs. `SPIKE_MODE=lsecheck` checks it on the device:
+attention merged from two parts against one call, eager, compiled and async-evaluated.
+
+**Changing the patch.** Edit the files in `Vendor/mlx-swift` (three git repos: mlx-swift and its
+`Source/Cmlx/mlx` and `Source/Cmlx/mlx-c` submodules), rebuild, then regenerate the patch from all
+three:
+
+    V=Vendor/mlx-swift
+    { git -C $V diff --ignore-submodules=all
+      git -C $V/Source/Cmlx/mlx diff --src-prefix=a/Source/Cmlx/mlx/ --dst-prefix=b/Source/Cmlx/mlx/
+      git -C $V/Source/Cmlx/mlx-c diff --src-prefix=a/Source/Cmlx/mlx-c/ --dst-prefix=b/Source/Cmlx/mlx-c/
+    } > patches/mlx-swift-0.33.0-sdpa-lse.patch
+
+Check that it applies to a fresh copy: `rm -rf Vendor/mlx-swift && mac/vendor_mlx_swift.sh`.
+
+**Moving to a newer mlx-swift.** Keep MLX on the commit exo runs, since the ring needs one protocol on
+every rank. Change the tag in `mac/vendor_mlx_swift.sh`, apply the patch to the new copy and fix any
+rejects by hand, then save it as `patches/mlx-swift-<version>-sdpa-lse.patch` and update the script.
+If upstream MLX ever exposes the log-sum-exp itself, drop the patch and point `project.yml` back at
+the GitHub package (`url:` and `exactVersion:`).
 
 ## 1. Ring check: `mac/run_spike.sh [mac_ip ipad_ip]`
 
@@ -89,3 +130,19 @@ random weights and no Mac model; with `--solo` (no traffic at all) a 2960-token 
 cache rows takes 2.5 s for ~20 s, then 4.0-4.4 s; the K/V exchange adds ~20% only once throttled.
 About 30 s idle buys back ~10 s at full speed. Zero-copy sockets and idling the GPU between passes
 (`SPIKE_NO_WARM=1`) changed nothing.
+
+**Hiding the K/V exchange.** When the Mac asks (pass meta `"overlap"`), each block queues attention over
+the cache's older rows (`asyncEval`) before sending its K/V, so it runs while the Mac's are in flight,
+then attends over this chunk's rows and merges the two by their log-sum-exp. MLX computes that in its
+fused attention for training only; `patches/mlx-swift-0.33.0-sdpa-lse.patch` exposes it as
+`MLXFast.scaledDotProductAttentionWithLSE`, and `mac/vendor_mlx_swift.sh` fetches mlx-swift 0.33.0 into
+`Vendor/` (ignored) and applies it. On the real block 0 the merged attention is 1.34e-3 from PyTorch
+(1.24e-3 in one call) at 213.6 vs 210.1 ms eager; `SPIKE_MODE=lsecheck` checks the merge on random data
+at the split's shapes. It didn't make the split faster (19.62 vs 19.77 s per full-cache chunk): the
+critical path is the transfer both ways plus the rest of each block, not attention, and the iPad's
+waiting just became attention. The exchange is ~60-70 ms per block both ways, mostly bytes (the Mac's
+~24 MB K/V frame at the link's 858 MB/s); frames now go out without copying the arrays (no change),
+and with `"kv_bits": 8` both sides send int8 K/V with an FP32 scale per token and head (51.6% of the
+bytes; frames as good as 16-bit, no gain measured under throttling, so the Mac leaves it off). Each
+pass reports `turn_ms`, from each Mac K/V's arrival to the next send here, so the Mac can measure the
+exchange's latency. Details in fastframes' MAC.md.

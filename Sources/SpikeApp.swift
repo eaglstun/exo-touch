@@ -40,7 +40,7 @@ struct ContentView: View {
         .onAppear {
             // Launched from the Mac with SPIKE_RANK and SPIKE_HOSTFILE_JSON: run at once
             let environment = ProcessInfo.processInfo.environment
-            if environment["SPIKE_HOSTFILE_JSON"] != nil || ["stage", "dit", "ditblock", "split"].contains(environment["SPIKE_MODE"]) {
+            if environment["SPIKE_HOSTFILE_JSON"] != nil || ["stage", "dit", "ditblock", "split", "lsecheck"].contains(environment["SPIKE_MODE"]) {
                 start()
             }
         }
@@ -67,6 +67,16 @@ struct ContentView: View {
                 } catch {
                     Task { @MainActor in log.add("FAILED: \(error)") }
                 }
+                Task { @MainActor in log.running = false }
+            }
+            return
+        }
+        if environment["SPIKE_MODE"] == "lsecheck" {
+            // Attention merged from two parts of the keys (SplitStage's overlap) against one call
+            log.running = true
+            let log = self.log
+            Task.detached {
+                LSECheck.run { line in Task { @MainActor in log.add(line) } }
                 Task { @MainActor in log.running = false }
             }
             return
