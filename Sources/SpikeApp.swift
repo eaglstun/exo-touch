@@ -40,7 +40,9 @@ struct ContentView: View {
         .onAppear {
             // Launched from the Mac with SPIKE_RANK and SPIKE_HOSTFILE_JSON: run at once
             let environment = ProcessInfo.processInfo.environment
-            if environment["SPIKE_HOSTFILE_JSON"] != nil || environment["SPIKE_MODE"] == "stage" { start() }
+            if environment["SPIKE_HOSTFILE_JSON"] != nil || ["stage", "dit", "ditblock", "split"].contains(environment["SPIKE_MODE"]) {
+                start()
+            }
         }
         // The ring needs the app in the foreground: keep the screen on while it runs
         .onChange(of: log.running) { _, running in
@@ -52,6 +54,46 @@ struct ContentView: View {
         let environment = ProcessInfo.processInfo.environment
         if environment["SPIKE_MODE"] == "stage" {
             startStage(port: UInt16(environment["SPIKE_PORT"] ?? "") ?? 5560)
+            return
+        }
+        if environment["SPIKE_MODE"] == "split" {
+            // A share of FastFrames-LingBot's DiT tokens, in step with the Mac (lingbot_ipad_split.py)
+            log.running = true
+            let log = self.log
+            let port = UInt16(environment["SPIKE_PORT"] ?? "") ?? SplitStage.defaultPort
+            Task.detached {
+                do {
+                    try SplitStage.serve(port: port) { line in Task { @MainActor in log.add(line) } }
+                } catch {
+                    Task { @MainActor in log.add("FAILED: \(error)") }
+                }
+                Task { @MainActor in log.running = false }
+            }
+            return
+        }
+        if environment["SPIKE_MODE"] == "ditblock" {
+            // FastFrames-LingBot's real DiT block, checked against PyTorch's output (no ring)
+            log.running = true
+            let log = self.log
+            let name = environment["SPIKE_BLOCK"] ?? "block0"
+            Task.detached {
+                do {
+                    try DiTBlockCheck.run(name: name) { line in Task { @MainActor in log.add(line) } }
+                } catch {
+                    Task { @MainActor in log.add("FAILED: \(error)") }
+                }
+                Task { @MainActor in log.running = false }
+            }
+            return
+        }
+        if environment["SPIKE_MODE"] == "dit" {
+            // FastFrames-LingBot DiT block shapes on this GPU (no ring, no Mac rank)
+            log.running = true
+            let log = self.log
+            Task.detached {
+                DiTBench.run { line in Task { @MainActor in log.add(line) } }
+                Task { @MainActor in log.running = false }
+            }
             return
         }
         guard let hostfile = environment["SPIKE_HOSTFILE_JSON"] else {
