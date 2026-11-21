@@ -5,6 +5,7 @@ Yes. mlx-swift 0.33.0 pins MLX v0.32.4, the same commit exo runs, so both ranks 
 
 ## Setup
 
+    mac/vendor_mlx_swift.sh    # mlx-swift 0.33.0 + patches/mlx-swift-0.33.0-sdpa-lse.patch into Vendor/
     xcodegen generate
     xcodebuild -project ExoIPadSpike.xcodeproj -scheme ExoIPadSpike -configuration Release \
       -destination 'id=<device udid>' -derivedDataPath build -allowProvisioningUpdates build
@@ -89,3 +90,19 @@ random weights and no Mac model; with `--solo` (no traffic at all) a 2960-token 
 cache rows takes 2.5 s for ~20 s, then 4.0-4.4 s; the K/V exchange adds ~20% only once throttled.
 About 30 s idle buys back ~10 s at full speed. Zero-copy sockets and idling the GPU between passes
 (`SPIKE_NO_WARM=1`) changed nothing.
+
+**Hiding the K/V exchange.** When the Mac asks (pass meta `"overlap"`), each block queues attention over
+the cache's older rows (`asyncEval`) before sending its K/V, so it runs while the Mac's are in flight,
+then attends over this chunk's rows and merges the two by their log-sum-exp. MLX computes that in its
+fused attention for training only; `patches/mlx-swift-0.33.0-sdpa-lse.patch` exposes it as
+`MLXFast.scaledDotProductAttentionWithLSE`, and `mac/vendor_mlx_swift.sh` fetches mlx-swift 0.33.0 into
+`Vendor/` (ignored) and applies it. On the real block 0 the merged attention is 1.34e-3 from PyTorch
+(1.24e-3 in one call) at 213.6 vs 210.1 ms eager; `SPIKE_MODE=lsecheck` checks the merge on random data
+at the split's shapes. It didn't make the split faster (19.62 vs 19.77 s per full-cache chunk): the
+critical path is the transfer both ways plus the rest of each block, not attention, and the iPad's
+waiting just became attention. The exchange is ~60-70 ms per block both ways, mostly bytes (the Mac's
+~24 MB K/V frame at the link's 858 MB/s); frames now go out without copying the arrays (no change),
+and with `"kv_bits": 8` both sides send int8 K/V with an FP32 scale per token and head (51.6% of the
+bytes; frames as good as 16-bit, no gain measured under throttling, so the Mac leaves it off). Each
+pass reports `turn_ms`, from each Mac K/V's arrival to the next send here, so the Mac can measure the
+exchange's latency. Details in fastframes' MAC.md.
