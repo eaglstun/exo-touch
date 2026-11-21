@@ -65,20 +65,20 @@ dtype rules as `scripts/lingbot_block_mlx.py` and compares. At 832x464:
 
 The iPad runs the real block at 92% of the Mac's speed (compiled; `compile` is worth 1.34x here).
 
-## 5. A LingBot DiT pass split with the Mac: `mac/run_split_stage.sh`
+## 5. LingBot's DiT shared with the Mac: `mac/run_split_stage.sh`
 
-`Sources/SplitStage.swift` (`SPIKE_MODE=split`, port 5570) runs a share of one denoising pass's
-tokens through all 30 blocks, in step with fastframes' `scripts/lingbot_ipad_split.py` on the Mac:
-in each block both sides send their tokens' keys and values, write both into their own KV cache,
-and attend over all of it. Setup sends the weights, caches, text K/V and camera rows once (8.1 GB
-in 11 s; the app's footprint is then 8.3 GB). While waiting for the Mac's K/V the GPU stays busy,
-so it doesn't clock down. One pass at 832x464, 55% of the tokens here:
+`Sources/SplitStage.swift` (`SPIKE_MODE=split`, port 5570) is the iPad side of fastframes'
+`apps/lingbot/ipad.py` (IPadAssist): every denoising pass's chunk tokens are split, this device runs
+its share through all 30 blocks, and in each block both sides swap their tokens' canonical (pre-RoPE)
+keys and values, rotate the other's, and attend over the whole cache. A session mirrors the Mac's
+cache: weights once (2.6 GB in ~3.7 s; footprint 8.2 GB at 832x464), the prompt's text K/V, resets,
+the Mac's eviction copies, each chunk's RoPE table and camera tokens (it computes its own camera
+rows), and the refined rows the Mac commits after a chunk. The Mac moves the split between chunks
+to where both finish a pass together; the iPad reports its thermal state with each pass.
 
-| | per pass |
-|---|---|
-| M4 Max alone (PyTorch MPS), quiet | 4.53 s |
-| split with this iPad | 3.14-3.25 s (~1.4x) |
-| M4 Max alone while Photos analyses media | ~7.8 s |
-| split, same moment | ~3.7 s (~2.1x) |
-
-The split pass matches the Mac alone to 4.9e-3 relative L2.
+fastframes' `scripts/lingbot_ipad_split.py` generates a 10-chunk world on the Mac alone, split, and
+alone again: full-cache chunks 21.6 s split vs 27.3 s alone in the same session (1.26x; ~1.2x against
+the Mac's quieter chunks), frames clean and the same scene, drifting in detail as an autoregressive
+model does (PSNR 43 dB at chunk 0, ~20 dB by chunk 9). The iPad stayed thermally nominal; both sides
+waited 1-1.4 s per pass for the other's K/V, the next thing to hide. `demo.py --ipad <address>`
+runs the browser demo this way at 832x464.
