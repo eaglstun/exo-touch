@@ -1,0 +1,243 @@
+diff --git a/Source/Cmlx/include-framework/mlx-c-fast.h b/Source/Cmlx/include-framework/mlx-c-fast.h
+index 4763516..060bf2e 100644
+--- a/Source/Cmlx/include-framework/mlx-c-fast.h
++++ b/Source/Cmlx/include-framework/mlx-c-fast.h
+@@ -202,6 +202,17 @@ int mlx_fast_rope_dynamic(
+     const mlx_array offset,
+     const mlx_array freqs /* may be null */,
+     const mlx_stream s);
++/**
++ * Unmasked attention that also returns each query row's logsumexp ([B, H, L_q, 1] float32).
++ */
++int mlx_fast_scaled_dot_product_attention_lse(
++    mlx_array* res,
++    mlx_array* lse,
++    const mlx_array queries,
++    const mlx_array keys,
++    const mlx_array values,
++    float scale,
++    const mlx_stream s);
+ int mlx_fast_scaled_dot_product_attention(
+     mlx_array* res,
+     const mlx_array queries,
+diff --git a/Source/Cmlx/include/mlx/c/fast.h b/Source/Cmlx/include/mlx/c/fast.h
+index e4445f7..0e865a6 100644
+--- a/Source/Cmlx/include/mlx/c/fast.h
++++ b/Source/Cmlx/include/mlx/c/fast.h
+@@ -202,6 +202,17 @@ int mlx_fast_rope_dynamic(
+     const mlx_array offset,
+     const mlx_array freqs /* may be null */,
+     const mlx_stream s);
++/**
++ * Unmasked attention that also returns each query row's logsumexp ([B, H, L_q, 1] float32).
++ */
++int mlx_fast_scaled_dot_product_attention_lse(
++    mlx_array* res,
++    mlx_array* lse,
++    const mlx_array queries,
++    const mlx_array keys,
++    const mlx_array values,
++    float scale,
++    const mlx_stream s);
+ int mlx_fast_scaled_dot_product_attention(
+     mlx_array* res,
+     const mlx_array queries,
+diff --git a/Source/MLX/MLXFast.swift b/Source/MLX/MLXFast.swift
+index 2a53343..5c0ca3b 100644
+--- a/Source/MLX/MLXFast.swift
++++ b/Source/MLX/MLXFast.swift
+@@ -172,6 +172,20 @@ public enum MLXFast {
+         return MLXArray(result)
+     }
+ 
++    /// Unmasked ``scaledDotProductAttention(queries:keys:values:scale:mask:sinks:memoryEfficientThreshold:forceFused:stream:)``
++    /// that also returns each query row's natural-log sum of `exp(scale * q.k)` over these keys,
++    /// `[B, heads, L_q, 1]` float32, so attention over two sets of keys can be merged. Fused kernels only.
++    public static func scaledDotProductAttentionWithLSE(
++        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
++        stream: StreamOrDevice = .default
++    ) -> (output: MLXArray, lse: MLXArray) {
++        var result = mlx_array_new()
++        var lse = mlx_array_new()
++        mlx_fast_scaled_dot_product_attention_lse(
++            &result, &lse, queries.ctx, keys.ctx, values.ctx, scale, stream.ctx)
++        return (MLXArray(result), MLXArray(lse))
++    }
++
+     public enum ScaledDotProductAttentionMaskMode {
+         case none
+         case array(MLXArray)
+diff --git a/Source/Cmlx/mlx/mlx/fast.cpp b/Source/Cmlx/mlx/mlx/fast.cpp
+index 2afb834..b721170 100644
+--- a/Source/Cmlx/mlx/mlx/fast.cpp
++++ b/Source/Cmlx/mlx/mlx/fast.cpp
+@@ -710,17 +710,18 @@ bool RoPE::is_equivalent(const Primitive& other) const {
+       forward_ == a_other.forward_);
+ }
+ 
+-/** Computes: O = softmax(Q @ K.T) @ V **/
+-array scaled_dot_product_attention(
++/** Computes: O = softmax(Q @ K.T) @ V, and with want_lse also the logsumexp **/
++static std::vector<array> scaled_dot_product_attention_impl(
+     const array& queries,
+     const array& keys,
+     const array& values,
+     const float scale,
+-    const std::string& mask_mode /* = "" */,
+-    std::optional<array> mask_arr /* = {} */,
+-    const std::optional<array>& sinks /* = {} */,
+-    bool force_fused /* = false */,
+-    StreamOrDevice s /* = {} */) {
++    const std::string& mask_mode,
++    std::optional<array> mask_arr,
++    const std::optional<array>& sinks,
++    bool force_fused,
++    bool want_lse,
++    StreamOrDevice s) {
+   for (const auto& tensor : {queries, keys, values}) {
+     if (tensor.ndim() != 4) {
+       std::ostringstream msg;
+@@ -926,7 +927,7 @@ array scaled_dot_product_attention(
+ 
+   bool is_training = detail::in_grad_tracing();
+   bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
+-  bool output_logsumexp = is_training && has_fast_vjp;
++  bool output_logsumexp = (is_training && has_fast_vjp) || want_lse;
+   if (!ScaledDotProductAttention::use_fallback(
+           q,
+           k,
+@@ -959,17 +960,51 @@ array scaled_dot_product_attention(
+         output_logsumexp,
+         force_fused);
+     if (output_logsumexp) {
+-      return array::make_arrays(
++      auto outputs = array::make_arrays(
+           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
+           {final_type, float32},
+           primitive,
+-          std::move(inputs))[0];
++          std::move(inputs));
++      if (!want_lse) {
++        return {outputs[0]};
++      }
++      return outputs;
+     } else {
+-      return array(
+-          std::move(out_shape), final_type, primitive, std::move(inputs));
++      return {array(
++          std::move(out_shape), final_type, primitive, std::move(inputs))};
+     }
+   }
+-  return fallback(std::move(inputs))[0];
++  if (want_lse) {
++    throw std::invalid_argument(
++        "[scaled_dot_product_attention_lse] no fused kernel for these inputs");
++  }
++  return {fallback(std::move(inputs))[0]};
++}
++
++array scaled_dot_product_attention(
++    const array& queries,
++    const array& keys,
++    const array& values,
++    const float scale,
++    const std::string& mask_mode /* = "" */,
++    std::optional<array> mask_arr /* = {} */,
++    const std::optional<array>& sinks /* = {} */,
++    bool force_fused /* = false */,
++    StreamOrDevice s /* = {} */) {
++  return scaled_dot_product_attention_impl(
++      queries, keys, values, scale, mask_mode, std::move(mask_arr), sinks,
++      force_fused, /* want_lse = */ false, s)[0];
++}
++
++std::vector<array> scaled_dot_product_attention_lse(
++    const array& queries,
++    const array& keys,
++    const array& values,
++    const float scale,
++    StreamOrDevice s /* = {} */) {
++  return scaled_dot_product_attention_impl(
++      queries, keys, values, scale, "", std::nullopt, std::nullopt,
++      /* force_fused = */ false, /* want_lse = */ true, s);
+ }
+ 
+ std::vector<array> ScaledDotProductAttention::vjp(
+diff --git a/Source/Cmlx/mlx/mlx/fast.h b/Source/Cmlx/mlx/mlx/fast.h
+index 14a46de..7524ae4 100644
+--- a/Source/Cmlx/mlx/mlx/fast.h
++++ b/Source/Cmlx/mlx/mlx/fast.h
+@@ -60,6 +60,16 @@ MLX_API array scaled_dot_product_attention(
+     bool force_fused = false,
+     StreamOrDevice s = {});
+ 
++/** Unmasked scaled_dot_product_attention that also returns each query row's natural-log sum of
++ * exp(scale * q.k) over the keys, shape [B, n_q_heads, L_q, 1] float32: attention over two sets of
++ * keys can then be merged. Fused kernels only (throws where there is none). **/
++MLX_API std::vector<array> scaled_dot_product_attention_lse(
++    const array& queries,
++    const array& keys,
++    const array& values,
++    const float scale,
++    StreamOrDevice s = {});
++
+ MLX_API std::vector<array> gated_delta_update(
+     const array& queries,
+     const array& keys,
+diff --git a/Source/Cmlx/mlx-c/mlx/c/fast.cpp b/Source/Cmlx/mlx-c/mlx/c/fast.cpp
+index 2054aeb..567574d 100644
+--- a/Source/Cmlx/mlx-c/mlx/c/fast.cpp
++++ b/Source/Cmlx/mlx-c/mlx/c/fast.cpp
+@@ -651,6 +651,30 @@ extern "C" int mlx_fast_rope_dynamic(
+   }
+   return 0;
+ }
++extern "C" int mlx_fast_scaled_dot_product_attention_lse(
++    mlx_array* res,
++    mlx_array* lse,
++    const mlx_array queries,
++    const mlx_array keys,
++    const mlx_array values,
++    float scale,
++    const mlx_stream s) {
++  try {
++    auto outputs = mlx::core::fast::scaled_dot_product_attention_lse(
++        mlx_array_get_(queries),
++        mlx_array_get_(keys),
++        mlx_array_get_(values),
++        scale,
++        mlx_stream_get_(s));
++    mlx_array_set_(*res, outputs[0]);
++    mlx_array_set_(*lse, outputs[1]);
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++
+ extern "C" int mlx_fast_scaled_dot_product_attention(
+     mlx_array* res,
+     const mlx_array queries,
+diff --git a/Source/Cmlx/mlx-c/mlx/c/fast.h b/Source/Cmlx/mlx-c/mlx/c/fast.h
+index e4445f7..0e865a6 100644
+--- a/Source/Cmlx/mlx-c/mlx/c/fast.h
++++ b/Source/Cmlx/mlx-c/mlx/c/fast.h
+@@ -202,6 +202,17 @@ int mlx_fast_rope_dynamic(
+     const mlx_array offset,
+     const mlx_array freqs /* may be null */,
+     const mlx_stream s);
++/**
++ * Unmasked attention that also returns each query row's logsumexp ([B, H, L_q, 1] float32).
++ */
++int mlx_fast_scaled_dot_product_attention_lse(
++    mlx_array* res,
++    mlx_array* lse,
++    const mlx_array queries,
++    const mlx_array keys,
++    const mlx_array values,
++    float scale,
++    const mlx_stream s);
+ int mlx_fast_scaled_dot_product_attention(
+     mlx_array* res,
+     const mlx_array queries,

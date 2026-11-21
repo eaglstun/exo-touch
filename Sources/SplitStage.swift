@@ -342,6 +342,9 @@ enum SplitStage {
         var pre: (([MLXArray]) -> [MLXArray])!
         var post: (([MLXArray]) -> [MLXArray])!
         var rotate: (([MLXArray]) -> [MLXArray])!
+        var attend: (([MLXArray]) -> [MLXArray])!
+        var attendLSE: (([MLXArray]) -> [MLXArray])!
+        var merge: (([MLXArray]) -> [MLXArray])!
 
         func compileBlocks(dim: Int) {
             let heads = heads, d = dim / heads, eps = eps, attnEps = attnEps
@@ -370,6 +373,13 @@ enum SplitStage {
                     scale: scale, mask: nil
                 ).transposed(0, 2, 1, 3)
             }
+            // Attention over one part of the keys, with each row's log-sum-exp for merging: [1, L, H, D], [1, L, H, 1]
+            func attentionLSE(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray) -> [MLXArray] {
+                let (out, lse) = MLXFast.scaledDotProductAttentionWithLSE(
+                    queries: q.transposed(0, 2, 1, 3), keys: k.transposed(0, 2, 1, 3), values: v.transposed(0, 2, 1, 3),
+                    scale: scale)
+                return [out.transposed(0, 2, 1, 3), lse.transposed(0, 2, 1, 3)]
+            }
             func modulation(_ m: MLXArray, _ timeE0: MLXArray) -> [MLXArray] {
                 split(m.expandedDimensions(axis: 0) + timeE0, parts: 6, axis: 2).map { $0.squeezed(axis: 2) }
             }
@@ -386,22 +396,32 @@ enum SplitStage {
             }
             // [canonical key, rope rows] -> [physical key]
             rotate = compile { a in [ropeReal(a[0], a[1])] }
-            // [value, modulation, time_e0, query, cache_k, cache_v, o_w, o_b, cam, norm3_w, norm3_b, cq_w, cq_b,
+            // [query, keys, values] -> [attended]; with LSE -> [attended, log-sum-exp]
+            attend = compile { a in [attention(a[0], a[1], a[2])] }
+            attendLSE = compile { a in attentionLSE(a[0], a[1], a[2]) }
+            // [out A, lse A, out B, lse B] -> [attention over A and B]: each part weighted by its share of
+            // the softmax denominator
+            merge = compile { a in
+                let lse = logAddExp(a[1], a[3])
+                return [(a[0].asType(.float32) * exp(a[1] - lse) + a[2].asType(.float32) * exp(a[3] - lse))
+                    .asType(a[0].dtype)]
+            }
+            // [value, modulation, time_e0, attended, o_w, o_b, cam, norm3_w, norm3_b, cq_w, cq_b,
             //  cross_norm_q, co_w, co_b, text_k, text_v, up_w, up_b, down_w, down_b] -> [value]
             post = compile { a in
                 let tokens = a[0].dim(1)
                 let e = modulation(a[1], a[2])
                 var value = a[0]
-                value = value + linear(attention(a[3], a[4], a[5]).reshaped([1, tokens, dim]), a[6], a[7]) * e[2]
-                value = (1.0 + a[8][0]) * value + a[8][1]
-                let q2 = rmsNorm(linear(layerNorm(value, norm3Eps, a[9], a[10]), a[11], a[12]), a[13], crossEps)
-                value = value + linear(attention(q2.reshaped([1, tokens, heads, d]), a[16], a[17])
-                                           .reshaped([1, tokens, dim]), a[14], a[15])
+                value = value + linear(a[3].reshaped([1, tokens, dim]), a[4], a[5]) * e[2]
+                value = (1.0 + a[6][0]) * value + a[6][1]
+                let q2 = rmsNorm(linear(layerNorm(value, norm3Eps, a[7], a[8]), a[9], a[10]), a[11], crossEps)
+                value = value + linear(attention(q2.reshaped([1, tokens, heads, d]), a[14], a[15])
+                                           .reshaped([1, tokens, dim]), a[12], a[13])
                 let hidden = layerNorm(value, eps).asType(.float32) * (1 + e[4]) + e[3]
-                let up = linear(hidden, a[18], a[19]).asType(.float32)
+                let up = linear(hidden, a[16], a[17]).asType(.float32)
                 let gelu = (0.5 * up * (1 + tanh(0.7978845608028654 * (up + 0.044715 * up * up * up))))
                     .asType(.bfloat16)
-                return [value + linear(gelu, a[20], a[21]) * e[5]]
+                return [value + linear(gelu, a[18], a[19]) * e[5]]
             }
         }
 
@@ -414,6 +434,9 @@ enum SplitStage {
             // Diagnostics (mac/split_fake_mac.py): "solo" takes one K/V frame from the Mac and uses it in
             // every block, sending nothing: the pass's GPU work with no traffic or copies beside it
             let solo = message.meta["solo"] as? Bool ?? false
+            // The Mac's choice: attend over the cache's older rows while the K/V are in flight, then over this
+            // chunk's rows, and merge the two (the first chunk has no older rows; an older Mac doesn't ask)
+            let overlap = (message.meta["overlap"] as? Bool ?? false) && rows > 0
             var soloKV: Message?
             // An idle GPU clocks down within milliseconds (RemoteStageServer); keep it busy while waiting
             let warmer = MLXRandom.normal([256, 256])
@@ -428,6 +451,9 @@ enum SplitStage {
                                w["norm_k"]!, ownRope])
                 eval(qkv)
                 phase[0] += now() - t
+                // Queued now, it runs while the K/V are encoded, sent and the Mac's are in flight
+                let older = overlap ? attendLSE([qkv[0], cacheK[i][0..., ..<rows], cacheV[i][0..., ..<rows]]) : []
+                if overlap { asyncEval(older) }
                 if !solo { send(encode(op: "kv", layer: i, arrays: [("k", qkv[1]), ("v", qkv[2])])) }
                 t = now()
                 cacheK[i][0..., (rows + start) ..< end] = rotate([qkv[1], ownRope])[0]
@@ -435,7 +461,8 @@ enum SplitStage {
                 eval(cacheK[i], cacheV[i])
                 phase[1] += now() - t
                 let waitStart = DispatchTime.now().uptimeNanoseconds
-                let theirs = try soloKV ?? inbox.pop(idle: SplitStage.keepsWarm ? { eval(matmul(warmer, warmer)) } : nil)
+                let keepWarm = SplitStage.keepsWarm && !overlap  // the older rows' attention keeps it busy
+                let theirs = try soloKV ?? inbox.pop(idle: keepWarm ? { eval(matmul(warmer, warmer)) } : nil)
                 if solo { soloKV = theirs }
                 waited += DispatchTime.now().uptimeNanoseconds - waitStart
                 guard theirs.op == "kv", solo || theirs.layer == i else {
@@ -447,8 +474,10 @@ enum SplitStage {
                 eval(cacheK[i], cacheV[i])
                 phase[2] += now() - t
                 t = now()
-                let readK = cacheK[i][0..., ..<end], readV = cacheV[i][0..., ..<end]
-                value = post([value, w["modulation"]!, timeE0, qkv[0], readK, readV, w["o_weight"]!, w["o_bias"]!,
+                let attended = overlap
+                    ? merge(older + attendLSE([qkv[0], cacheK[i][0..., rows ..< end], cacheV[i][0..., rows ..< end]]))[0]
+                    : attend([qkv[0], cacheK[i][0..., ..<end], cacheV[i][0..., ..<end]])[0]
+                value = post([value, w["modulation"]!, timeE0, attended, w["o_weight"]!, w["o_bias"]!,
                               camera[i], w["norm3_weight"]!, w["norm3_bias"]!, w["cross_q_weight"]!,
                               w["cross_q_bias"]!, w["cross_norm_q"]!, w["cross_o_weight"]!, w["cross_o_bias"]!,
                               textK[i], textV[i], w["ffn_up_weight"]!, w["ffn_up_bias"]!, w["ffn_down_weight"]!,

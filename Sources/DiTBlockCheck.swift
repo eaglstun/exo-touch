@@ -61,6 +61,21 @@ enum DiTBlockCheck {
             ).transposed(0, 2, 1, 3)
         }
 
+        // SplitStage's overlap: the older cache rows and this chunk's rows attended separately, merged by
+        // their log-sum-exp
+        func mergedAttention(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, older: Int) -> MLXArray {
+            func part(_ k: MLXArray, _ v: MLXArray) -> (MLXArray, MLXArray) {
+                let (out, lse) = MLXFast.scaledDotProductAttentionWithLSE(
+                    queries: q.transposed(0, 2, 1, 3), keys: k.transposed(0, 2, 1, 3), values: v.transposed(0, 2, 1, 3),
+                    scale: scale)
+                return (out.transposed(0, 2, 1, 3), lse.transposed(0, 2, 1, 3))
+            }
+            let (a, la) = part(k[0..., ..<older], v[0..., ..<older]), (b, lb) = part(k[0..., older...], v[0..., older...])
+            let lse = logAddExp(la, lb)
+            return (a.asType(.float32) * exp(la - lse) + b.asType(.float32) * exp(lb - lse)).asType(a.dtype)
+        }
+        var splitAttention = false
+
         func block(_ inputs: [MLXArray]) -> [MLXArray] {
             var value = inputs[0]
             var cacheK = inputs[1], cacheV = inputs[2]
@@ -72,7 +87,8 @@ enum DiTBlockCheck {
             let key = ropeReal(rmsNorm(qkv[1], "norm_k", meta.attn_eps).reshaped([1, t, h, d]))
             cacheK[0..., (end - t) ..< end] = key
             cacheV[0..., (end - t) ..< end] = qkv[2].reshaped([1, t, h, d])
-            let attended = attention(query, cacheK, cacheV)
+            let attended = splitAttention ? mergedAttention(query, cacheK, cacheV, older: end - t)
+                                          : attention(query, cacheK, cacheV)
             value = value + linear(attended.reshaped([1, t, dim]), "o_weight", "o_bias") * e[2]
             let cam = w["cam"]!
             value = (1.0 + cam[0]) * value + cam[1]
@@ -122,7 +138,14 @@ enum DiTBlockCheck {
         let compiledOut = compiled(freshInputs())
         eval(compiledOut)
         compare("compiled out", compiledOut[0], w["output"]!)
+        splitAttention = true
+        let merged = block(freshInputs())
+        eval(merged)
+        compare("split attn  ", merged[0], w["output"]!)
+        let splitMs = time(block)
+        splitAttention = false
         let eagerMs = time(block), compiledMs = time(compiled)
+        log(String(format: "older rows + this chunk's rows, merged (eager): %.1f ms", splitMs))
         let torchMs = meta.torch_block_ms
         log(String(format: "time per block: Mac PyTorch %.1f ms | this device eager %.1f ms | compiled %.1f ms",
                    torchMs, eagerMs, compiledMs))
