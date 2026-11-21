@@ -1,6 +1,8 @@
 import Foundation
 import Metal
 import MLX
+import notify
+import UIKit
 
 /// This iPad's share of FastFrames-LingBot's DiT, in step with a Mac (fastframes' apps/lingbot/ipad.py,
 /// IPadAssist). Every denoising pass's chunk tokens are split: the Mac keeps [0, start), this device
@@ -101,6 +103,38 @@ enum SplitStage {
         }
     }
 
+    // MARK: probes
+
+    /// The system's thermal pressure (finer than ProcessInfo.thermalState): 0 nominal, 10 light,
+    /// 20 moderate, 30 heavy, 40 trapping, 50 sleeping; -1 if it can't be read
+    static func thermalPressure() -> Int {
+        var token: Int32 = 0
+        guard notify_register_check("com.apple.system.thermalpressurelevel", &token) == 0 else { return -1 }
+        defer { notify_cancel(token) }
+        var state: UInt64 = 0
+        return notify_get_state(token, &state) == 0 ? Int(state) : -1
+    }
+
+    /// Milliseconds a fixed integer loop takes on this thread: tells a slower CPU from a slower GPU
+    static func cpuProbe() -> Double {
+        let start = DispatchTime.now().uptimeNanoseconds
+        var x: UInt64 = 1
+        for i in 0 ..< 4_000_000 { x = x &* 6364136223846793005 &+ UInt64(i) }
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+        return x == 0 ? 0 : ms
+    }
+
+    /// "charging 80%", "unplugged 54%", "full 100%", and whether Low Power Mode is on
+    static func power() -> String {
+        DispatchQueue.main.sync {
+            let device = UIDevice.current
+            device.isBatteryMonitoringEnabled = true
+            let state = ["unknown", "unplugged", "charging", "full"][device.batteryState.rawValue]
+            return String(format: "%@ %.0f%%%@", state, device.batteryLevel * 100,
+                          ProcessInfo.processInfo.isLowPowerModeEnabled ? ", LOW POWER MODE" : "")
+        }
+    }
+
     // MARK: frames
 
     static func itemSize(_ dtype: DType) -> Int { dtype == .float32 ? 4 : 2 }
@@ -129,6 +163,9 @@ enum SplitStage {
         }
         return message
     }
+
+    /// Diagnostics: SPIKE_NO_WARM=1 leaves the GPU idle while a pass waits for the Mac's keys and values
+    static let keepsWarm = ProcessInfo.processInfo.environment["SPIKE_NO_WARM"] != "1"
 
     /// Header and bytes of `arrays` (evaluated): built on the compute thread, written by the sender
     static func encode(op: String, layer: Int = 0, meta: [String: Any] = [:], arrays: [(String, MLXArray)]) -> Data {
@@ -374,6 +411,10 @@ enum SplitStage {
             var value = message.arrays["value"]!
             let rows = end - tokens
             let ownRope = rope[start...], macRope = rope[..<start]
+            // Diagnostics (mac/split_fake_mac.py): "solo" takes one K/V frame from the Mac and uses it in
+            // every block, sending nothing: the pass's GPU work with no traffic or copies beside it
+            let solo = message.meta["solo"] as? Bool ?? false
+            var soloKV: Message?
             // An idle GPU clocks down within milliseconds (RemoteStageServer); keep it busy while waiting
             let warmer = MLXRandom.normal([256, 256])
             let began = DispatchTime.now().uptimeNanoseconds
@@ -387,16 +428,17 @@ enum SplitStage {
                                w["norm_k"]!, ownRope])
                 eval(qkv)
                 phase[0] += now() - t
-                send(encode(op: "kv", layer: i, arrays: [("k", qkv[1]), ("v", qkv[2])]))
+                if !solo { send(encode(op: "kv", layer: i, arrays: [("k", qkv[1]), ("v", qkv[2])])) }
                 t = now()
                 cacheK[i][0..., (rows + start) ..< end] = rotate([qkv[1], ownRope])[0]
                 cacheV[i][0..., (rows + start) ..< end] = qkv[2]
                 eval(cacheK[i], cacheV[i])
                 phase[1] += now() - t
                 let waitStart = DispatchTime.now().uptimeNanoseconds
-                let theirs = try inbox.pop(idle: { eval(matmul(warmer, warmer)) })
+                let theirs = try soloKV ?? inbox.pop(idle: SplitStage.keepsWarm ? { eval(matmul(warmer, warmer)) } : nil)
+                if solo { soloKV = theirs }
                 waited += DispatchTime.now().uptimeNanoseconds - waitStart
-                guard theirs.op == "kv", theirs.layer == i else {
+                guard theirs.op == "kv", solo || theirs.layer == i else {
                     throw Failure(description: "expected kv \(i), got \(theirs.op) \(theirs.layer)")
                 }
                 t = now()
@@ -421,9 +463,11 @@ enum SplitStage {
                         arrays: [("value", value.asType(.float32))]))
             passes += 1
             log(String(format: "pass %d: %d tokens x %d rows, %.0f ms (pre %.0f, own rows %.0f, Mac rows %.0f, "
-                       + "attention+rest %.0f, waiting %.0f); thermal %@, footprint %.1f GB",
+                       + "attention+rest %.0f, waiting %.0f); thermal %@ (pressure %d), CPU probe %.1f ms, %@, "
+                       + "footprint %.1f GB",
                        passes, share, end, ms, Double(phase[0]) / 1e6, Double(phase[1]) / 1e6, Double(phase[2]) / 1e6,
-                       Double(phase[3]) / 1e6, waitMs, thermal, Double(RemoteStageServer.footprint()) / 1e9))
+                       Double(phase[3]) / 1e6, waitMs, thermal, SplitStage.thermalPressure(), SplitStage.cpuProbe(),
+                       SplitStage.power(), Double(RemoteStageServer.footprint()) / 1e9))
         }
     }
 }
