@@ -28,6 +28,7 @@ enum SplitStage {
         var layer = 0
         var meta: [String: Any] = [:]
         var arrays: [String: MLXArray] = [:]
+        var arrived: UInt64 = 0  // when its last byte was read (uptime ns)
     }
 
     struct Failure: Error, CustomStringConvertible {
@@ -161,6 +162,7 @@ enum SplitStage {
             message.arrays[spec["name"] as! String] = MLXArray(
                 try RemoteStageServer.readExactly(connection, shape.reduce(1, *) * itemSize(dtype)), shape, dtype: dtype)
         }
+        message.arrived = DispatchTime.now().uptimeNanoseconds
         return message
     }
 
@@ -442,6 +444,9 @@ enum SplitStage {
             let warmer = MLXRandom.normal([256, 256])
             let began = DispatchTime.now().uptimeNanoseconds
             var waited: UInt64 = 0
+            // From each Mac K/V's arrival to sending this side's next block's: the Mac subtracts it from its
+            // send-to-receive time, leaving the exchange's latency both ways
+            var turn: UInt64 = 0, lastArrived: UInt64 = 0
             var phase = [UInt64](repeating: 0, count: 4)  // pre, own rows, Mac's rows, post (GPU, each evaluated)
             func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
             for i in 0 ..< layerCount {
@@ -455,6 +460,7 @@ enum SplitStage {
                 let older = overlap ? attendLSE([qkv[0], cacheK[i][0..., ..<rows], cacheV[i][0..., ..<rows]]) : []
                 if overlap { asyncEval(older) }
                 if !solo { send(encode(op: "kv", layer: i, arrays: [("k", qkv[1]), ("v", qkv[2])])) }
+                if i > 0 { turn += now() - lastArrived }
                 t = now()
                 cacheK[i][0..., (rows + start) ..< end] = rotate([qkv[1], ownRope])[0]
                 cacheV[i][0..., (rows + start) ..< end] = qkv[2]
@@ -464,6 +470,7 @@ enum SplitStage {
                 let keepWarm = SplitStage.keepsWarm && !overlap  // the older rows' attention keeps it busy
                 let theirs = try soloKV ?? inbox.pop(idle: keepWarm ? { eval(matmul(warmer, warmer)) } : nil)
                 if solo { soloKV = theirs }
+                lastArrived = theirs.arrived
                 waited += DispatchTime.now().uptimeNanoseconds - waitStart
                 guard theirs.op == "kv", solo || theirs.layer == i else {
                     throw Failure(description: "expected kv \(i), got \(theirs.op) \(theirs.layer)")
@@ -488,7 +495,8 @@ enum SplitStage {
             let ms = Double(DispatchTime.now().uptimeNanoseconds - began) / 1e6
             let waitMs = Double(waited) / 1e6
             let thermal = ["nominal", "fair", "serious", "critical"][ProcessInfo.processInfo.thermalState.rawValue]
-            send(encode(op: "result", meta: ["ms": ms, "wait_ms": waitMs, "thermal": thermal],
+            send(encode(op: "result", meta: ["ms": ms, "wait_ms": waitMs, "thermal": thermal,
+                                             "turn_ms": Double(turn) / 1e6],
                         arrays: [("value", value.asType(.float32))]))
             passes += 1
             log(String(format: "pass %d: %d tokens x %d rows, %.0f ms (pre %.0f, own rows %.0f, Mac rows %.0f, "
