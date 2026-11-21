@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 
 /// This iPad's share of FastFrames-LingBot's DiT, in step with a Mac (fastframes' apps/lingbot/ipad.py,
@@ -205,6 +206,13 @@ enum SplitStage {
                 norm3Eps = Float(meta["norm3_eps"] as! Double)
                 cameraWeights = message.arrays
                 weights = []
+                // MLX keeps freed buffers for reuse; past the GPU's working set Metal pages resources and
+                // a full-cache pass ran 2x slower. A small cache keeps the footprint under it.
+                let cacheLimit = Int(ProcessInfo.processInfo.environment["SPIKE_CACHE_LIMIT_MB"] ?? "") ?? 256
+                Memory.cacheLimit = cacheLimit * 1_000_000
+                let workingSet = MTLCreateSystemDefaultDevice()?.recommendedMaxWorkingSetSize ?? 0
+                log(String(format: "GPU working set %.1f GB; MLX buffer cache limit %d MB", Double(workingSet) / 1e9,
+                           cacheLimit))
                 let started = Date()
                 for _ in 0 ..< layerCount {
                     let layer = try inbox.pop()
@@ -370,29 +378,41 @@ enum SplitStage {
             let warmer = MLXRandom.normal([256, 256])
             let began = DispatchTime.now().uptimeNanoseconds
             var waited: UInt64 = 0
+            var phase = [UInt64](repeating: 0, count: 4)  // pre, own rows, Mac's rows, post (GPU, each evaluated)
+            func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
             for i in 0 ..< layerCount {
                 let w = weights[i]
+                var t = now()
                 let qkv = pre([value, w["modulation"]!, timeE0, w["qkv_weight"]!, w["qkv_bias"]!, w["norm_q"]!,
                                w["norm_k"]!, ownRope])
                 eval(qkv)
+                phase[0] += now() - t
                 send(encode(op: "kv", layer: i, arrays: [("k", qkv[1]), ("v", qkv[2])]))
+                t = now()
                 cacheK[i][0..., (rows + start) ..< end] = rotate([qkv[1], ownRope])[0]
                 cacheV[i][0..., (rows + start) ..< end] = qkv[2]
+                eval(cacheK[i], cacheV[i])
+                phase[1] += now() - t
                 let waitStart = DispatchTime.now().uptimeNanoseconds
                 let theirs = try inbox.pop(idle: { eval(matmul(warmer, warmer)) })
                 waited += DispatchTime.now().uptimeNanoseconds - waitStart
                 guard theirs.op == "kv", theirs.layer == i else {
                     throw Failure(description: "expected kv \(i), got \(theirs.op) \(theirs.layer)")
                 }
+                t = now()
                 cacheK[i][0..., rows ..< (rows + start)] = rotate([theirs.arrays["k"]!, macRope])[0]
                 cacheV[i][0..., rows ..< (rows + start)] = theirs.arrays["v"]!
+                eval(cacheK[i], cacheV[i])
+                phase[2] += now() - t
+                t = now()
                 let readK = cacheK[i][0..., ..<end], readV = cacheV[i][0..., ..<end]
                 value = post([value, w["modulation"]!, timeE0, qkv[0], readK, readV, w["o_weight"]!, w["o_bias"]!,
                               camera[i], w["norm3_weight"]!, w["norm3_bias"]!, w["cross_q_weight"]!,
                               w["cross_q_bias"]!, w["cross_norm_q"]!, w["cross_o_weight"]!, w["cross_o_bias"]!,
                               textK[i], textV[i], w["ffn_up_weight"]!, w["ffn_up_bias"]!, w["ffn_down_weight"]!,
                               w["ffn_down_bias"]!])[0]
-                eval(value, cacheK[i], cacheV[i])
+                eval(value)
+                phase[3] += now() - t
             }
             let ms = Double(DispatchTime.now().uptimeNanoseconds - began) / 1e6
             let waitMs = Double(waited) / 1e6
@@ -400,10 +420,10 @@ enum SplitStage {
             send(encode(op: "result", meta: ["ms": ms, "wait_ms": waitMs, "thermal": thermal],
                         arrays: [("value", value.asType(.float32))]))
             passes += 1
-            if passes % 4 == 0 {
-                log(String(format: "pass %d: %d tokens, %.0f ms here, %.0f ms of it waiting for the Mac's K/V; thermal %@",
-                           passes, share, ms, waitMs, thermal))
-            }
+            log(String(format: "pass %d: %d tokens x %d rows, %.0f ms (pre %.0f, own rows %.0f, Mac rows %.0f, "
+                       + "attention+rest %.0f, waiting %.0f); thermal %@, footprint %.1f GB",
+                       passes, share, end, ms, Double(phase[0]) / 1e6, Double(phase[1]) / 1e6, Double(phase[2]) / 1e6,
+                       Double(phase[3]) / 1e6, waitMs, thermal, Double(RemoteStageServer.footprint()) / 1e9))
         }
     }
 }
