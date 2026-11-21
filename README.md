@@ -63,7 +63,8 @@ dtype rules as `scripts/lingbot_block_mlx.py` and compares. At 832x464:
 | iPad Pro M5, MLX-Swift eager | 1.2e-3 | 209.7 ms |
 | iPad Pro M5, MLX-Swift compiled | 1.2e-3 | 156.8 ms |
 
-The iPad runs the real block at 92% of the Mac's speed (compiled; `compile` is worth 1.34x here).
+The iPad runs the real block at 92% of the Mac's speed (compiled; `compile` is worth 1.34x here)
+in a burst. After ~20-27 s of continuous GPU load it drops to ~0.5-0.6x and stays there (section 5).
 
 ## 5. LingBot's DiT shared with the Mac: `mac/run_split_stage.sh`
 
@@ -79,6 +80,12 @@ to where both finish a pass together; the iPad reports its thermal state with ea
 fastframes' `scripts/lingbot_ipad_split.py` generates a 10-chunk world on the Mac alone, split, and
 alone again: full-cache chunks 21.6 s split vs 27.3 s alone in the same session (1.26x; ~1.2x against
 the Mac's quieter chunks), frames clean and the same scene, drifting in detail as an autoregressive
-model does (PSNR 43 dB at chunk 0, ~20 dB by chunk 9). The iPad stayed thermally nominal; both sides
-waited 1-1.4 s per pass for the other's K/V, the next thing to hide. `demo.py --ipad <address>`
-runs the browser demo this way at 832x464.
+model does (PSNR 43 dB at chunk 0, ~20 dB by chunk 9). `demo.py --ipad <address>` runs the browser
+demo this way at 832x464.
+
+The gain is capped by the iPad's GPU throttling under sustained load, which `thermalState` doesn't
+report (it stays nominal, thermal pressure 0). `mac/split_fake_mac.py` speaks this protocol with
+random weights and no Mac model; with `--solo` (no traffic at all) a 2960-token pass over 27144
+cache rows takes 2.5 s for ~20 s, then 4.0-4.4 s; the K/V exchange adds ~20% only once throttled.
+About 30 s idle buys back ~10 s at full speed. Zero-copy sockets and idling the GPU between passes
+(`SPIKE_NO_WARM=1`) changed nothing.
