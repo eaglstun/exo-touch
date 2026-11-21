@@ -127,6 +127,10 @@ enum LlamaShard {
         }
 
         func linear(_ x: MLXArray, _ name: String) -> MLXArray {
+            // An unquantized checkpoint (bf16) keeps only the weight
+            if weights[name + ".scales"] == nil {
+                return matmul(x, weight(name + ".weight").T)
+            }
             let quantization = quantization(of: name)
             return quantizedMatmul(
                 x, weight(name + ".weight"), scales: weight(name + ".scales"),
@@ -136,6 +140,11 @@ enum LlamaShard {
 
         /// One expert's projection of each row, by `experts` (the expert of each row)
         func expertLinear(_ x: MLXArray, _ name: String, experts: MLXArray, sorted: Bool) -> MLXArray {
+            if weights[name + ".scales"] == nil {
+                return gatherMM(
+                    x, weight(name + ".weight").swappedAxes(-1, -2), rhsIndices: experts,
+                    sortedIndices: sorted)
+            }
             let quantization = quantization(of: name)
             return gatherQuantizedMM(
                 x, weight(name + ".weight"), scales: weight(name + ".scales"),
