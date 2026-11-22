@@ -26,7 +26,8 @@ targets:
         product: MLX
     settings:
       base:
-        DEVELOPMENT_TEAM: EKNXJ2NR3G
+        # Your Apple Developer team: xcodebuild ... DEVELOPMENT_TEAM=<team id>
+        DEVELOPMENT_TEAM: ""
         CODE_SIGN_STYLE: Automatic
         PRODUCT_BUNDLE_IDENTIFIER: com.eaglstun.ExoIPadSpike
         TARGETED_DEVICE_FAMILY: "2"
