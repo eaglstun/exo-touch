@@ -241,6 +241,11 @@ enum RemoteStageServer {
             return layers
         }
         var forwards = 0
+        // Decode timing (one-token forwards): building the graph, evaluating it, copying out, logged
+        // every 100 forwards when STAGE_TIMING=1
+        let timing = ProcessInfo.processInfo.environment["STAGE_TIMING"] == "1"
+        var timedForwards = 0
+        var buildSeconds = 0.0, evalSeconds = 0.0, copySeconds = 0.0
 
         func send(_ frame: Frame, _ payload: Data = Data()) throws {
             let header = try encoder.encode(frame)
@@ -251,8 +256,24 @@ enum RemoteStageServer {
             try writeAll(connection, message)
         }
 
+        // Between one decode forward and the next the node runs its own layers, ~5-10 ms in
+        // which an idle iPad GPU (and CPU) clocks down: a forward then took ~3x as long (7.4
+        // vs 2.6 ms of GPU for 8 Nemotron-30B layers). So for a short while after a forward
+        // the stage keeps the GPU busy with throwaway work until the next frame comes, and
+        // goes quiet between requests. STAGE_KEEP_WARM=0 turns this off.
+        let keepWarm = ProcessInfo.processInfo.environment["STAGE_KEEP_WARM"] != "0"
+        let warmWindow = Duration.milliseconds(250)
+        let warmer = MLXRandom.normal([256, 256])
+        var lastForward = ContinuousClock.now - warmWindow
+
         do {
             while true {
+                if keepWarm {
+                    var waiting = pollfd(fd: connection, events: Int16(POLLIN), revents: 0)
+                    while ContinuousClock.now - lastForward < warmWindow, poll(&waiting, 1, 0) == 0 {
+                        eval(matmul(warmer, warmer))
+                    }
+                }
                 let length = try readExactly(connection, 4).withUnsafeBytes {
                     UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self))
                 }
@@ -423,6 +444,8 @@ enum RemoteStageServer {
                             message: "no cache \(frame.handle) or dtype \(frame.dtype) on the stage"))
                         continue
                     }
+                    let clock = ContinuousClock()
+                    let built = clock.now
                     var hidden = MLXArray(payload, frame.shape, dtype: dtype)
                     switch entry {
                     case .single(var layerCaches):
@@ -433,14 +456,31 @@ enum RemoteStageServer {
                         caches[frame.handle] = .batch(layerCaches)
                     }
                     hidden = hidden.asType(dtype)
+                    let evaluated = clock.now
                     eval([hidden] + arrays(caches[frame.handle]!))
+                    let copied = clock.now
                     let data = hidden.asData(access: .copy).data
+                    if timing, frame.shape.count == 3, frame.shape[1] == 1 {
+                        let seconds = { (d: Duration) in Double(d.components.attoseconds) / 1e18 + Double(d.components.seconds) }
+                        buildSeconds += seconds(evaluated - built)
+                        evalSeconds += seconds(copied - evaluated)
+                        copySeconds += seconds(clock.now - copied)
+                        timedForwards += 1
+                        if timedForwards == 100 {
+                            log(String(
+                                format: "decode forward: build %.2f ms, eval %.2f ms, copy %.2f ms",
+                                buildSeconds * 10, evalSeconds * 10, copySeconds * 10))
+                            timedForwards = 0
+                            buildSeconds = 0; evalSeconds = 0; copySeconds = 0
+                        }
+                    }
                     try send(
                         Frame(
                             operation: "hidden", handle: frame.handle, shape: frame.shape, dtype: frame.dtype,
                             payloadBytes: data.count),
                         data)
                     forwards += 1
+                    lastForward = ContinuousClock.now
                 default:
                     try send(Frame(operation: "error", message: "a node doesn't send \(frame.operation)"))
                     return (forwards, caches.count)
