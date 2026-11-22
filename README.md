@@ -14,6 +14,16 @@ Yes. mlx-swift 0.33.0 pins MLX v0.32.4, the same commit exo runs, so both ranks 
 On the first run, iOS asks for Local Network access. Until you tap Allow, the ring fails with
 `Couldn't connect (error: 60)`.
 
+### The stats panel
+
+In stage mode (2b) and split mode (5), a panel takes the left third of the screen in landscape and
+the bottom third in portrait, beside the log. It shows the model and its layers, decode tok/s (or
+pass time), link MB/s each way, K/V cache size and the tokens it holds, and the app's memory
+against its iPadOS limit. The servers write counters to `Stats` (`Sources/Stats.swift`); the panel
+(`Sources/StatsPanel.swift`) copies them twice a second and works out rates and a minute of
+history. exo sends config.json, which names the architecture, not the checkpoint, so the name
+reads "Llama" unless the config carries `exo_model_id`, `model_id` or `_name_or_path`.
+
 ### The patched MLX in `Vendor/`
 
 The app builds against a local copy of mlx-swift, not the package from GitHub: `project.yml` points
@@ -27,11 +37,11 @@ package; with an unpatched copy the build fails on `scaledDotProductAttentionWit
 each query row's log-sum-exp, but only hand it out while differentiating. The patch exposes it for
 inference, so SplitStage can attend over two sets of keys separately and merge them (section 5):
 
-| layer | file | change |
-|---|---|---|
-| MLX C++ | `Source/Cmlx/mlx/mlx/fast.{h,cpp}` | `fast::scaled_dot_product_attention_lse(q, k, v, scale)` returns `{output, lse}`; lse is `[B, heads, L_q, 1]` float32, natural log. The existing function becomes a thin wrapper over a shared implementation with a `want_lse` flag, so its behaviour is unchanged. Throws if no fused kernel fits the inputs (no fallback). |
-| mlx-c | `Source/Cmlx/mlx-c/mlx/c/fast.{h,cpp}` and the two header copies in `Source/Cmlx/include*/` | `mlx_fast_scaled_dot_product_attention_lse(&res, &lse, q, k, v, scale, stream)` |
-| Swift | `Source/MLX/MLXFast.swift` | `MLXFast.scaledDotProductAttentionWithLSE(queries:keys:values:scale:stream:) -> (output, lse)` |
+| layer   | file                                                                                        | change                                                                                                                                                                                                                                                                                                                        |
+| ------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| MLX C++ | `Source/Cmlx/mlx/mlx/fast.{h,cpp}`                                                          | `fast::scaled_dot_product_attention_lse(q, k, v, scale)` returns `{output, lse}`; lse is `[B, heads, L_q, 1]` float32, natural log. The existing function becomes a thin wrapper over a shared implementation with a `want_lse` flag, so its behaviour is unchanged. Throws if no fused kernel fits the inputs (no fallback). |
+| mlx-c   | `Source/Cmlx/mlx-c/mlx/c/fast.{h,cpp}` and the two header copies in `Source/Cmlx/include*/` | `mlx_fast_scaled_dot_product_attention_lse(&res, &lse, q, k, v, scale, stream)`                                                                                                                                                                                                                                               |
+| Swift   | `Source/MLX/MLXFast.swift`                                                                  | `MLXFast.scaledDotProductAttentionWithLSE(queries:keys:values:scale:stream:) -> (output, lse)`                                                                                                                                                                                                                                |
 
 Unmasked attention only, which is all the split needs. `SPIKE_MODE=lsecheck` checks it on the device:
 attention merged from two parts against one call, eager, compiled and async-evaluated.
@@ -94,10 +104,10 @@ ms in which an idle iPad GPU clocks down. For 250 ms after each forward the stag
 throwaway matmuls until the next frame arrives, then goes quiet (`STAGE_KEEP_WARM=0` turns this off).
 Decode through exo's generator, the stage on the USB link:
 
-| model (layers on the iPad) | warm | idle | |
-|---|---|---|---|
-| Llama-3.2-1B-Instruct-4bit (8-16) | ~120 tok/s | ~76 tok/s | 1.57x |
-| Nemotron-3-Nano-30B-A3B-4bit (40-48) | ~80 tok/s | ~55 tok/s | 1.43x |
+| model (layers on the iPad)           | warm       | idle      |       |
+| ------------------------------------ | ---------- | --------- | ----- |
+| Llama-3.2-1B-Instruct-4bit (8-16)    | ~120 tok/s | ~76 tok/s | 1.57x |
+| Nemotron-3-Nano-30B-A3B-4bit (40-48) | ~80 tok/s  | ~55 tok/s | 1.43x |
 
 A forward's GPU time on the iPad is 2.7 ms warm and ~7 ms idle (`STAGE_TIMING=1` logs build, eval and
 copy every 100 decode forwards). Unlike the DiT split (section 5), decode is light enough not to
@@ -109,11 +119,11 @@ throttle: 96 s of back-to-back requests held ~79 tok/s on Nemotron-30B.
 (4 latent frames of queries against an 18-frame KV cache, BF16; `Sources/DiTBench.swift`). The Mac
 runs the same shapes with `scripts/bench_dit_block.py` in fastframes (branch `ipad-dit-bench`).
 
-| per block | iPad Pro 11" M5, MLX | M4 Max, PyTorch MPS (the demo today) | M4 Max, MLX |
-|---|---|---|---|
-| 832x464 (6,032 x 27,144 tokens) | 160.4 ms | 174.8 ms | 124.4 ms |
-| 576x320 | 50.2 ms | 39.5 ms | 39.2 ms |
-| 416x240 | 22.9 ms | 17.7 ms | 17.7 ms |
+| per block                       | iPad Pro 11" M5, MLX | M4 Max, PyTorch MPS (the demo today) | M4 Max, MLX |
+| ------------------------------- | -------------------- | ------------------------------------ | ----------- |
+| 832x464 (6,032 x 27,144 tokens) | 160.4 ms             | 174.8 ms                             | 124.4 ms    |
+| 576x320                         | 50.2 ms              | 39.5 ms                              | 39.2 ms     |
+| 416x240                         | 22.9 ms              | 17.7 ms                              | 17.7 ms     |
 
 The M5's GEMMs run at 10.7-13.6 TFLOPS and its attention at 9.9-11.1, close to the M4 Max
 (12.7-14.8 and 10.5-12.5). The link is the limit: the iPad joins the Mac as a USB device at
@@ -128,12 +138,12 @@ fastframes' `scripts/lingbot_block_capture.py` saves LingBot's real DiT block 0 
 PyTorch's output) during a full-cache chunk; `Sources/DiTBlockCheck.swift` runs it here with the same
 dtype rules as `scripts/lingbot_block_mlx.py` and compares. At 832x464:
 
-| | output vs PyTorch (relative L2) | per block |
-|---|---|---|
-| M4 Max, PyTorch MPS (the demo) | reference | 144.1 ms |
-| M4 Max, MLX compiled | 8.4e-4 | 127.4 ms |
-| iPad Pro M5, MLX-Swift eager | 1.2e-3 | 209.7 ms |
-| iPad Pro M5, MLX-Swift compiled | 1.2e-3 | 156.8 ms |
+|                                 | output vs PyTorch (relative L2) | per block |
+| ------------------------------- | ------------------------------- | --------- |
+| M4 Max, PyTorch MPS (the demo)  | reference                       | 144.1 ms  |
+| M4 Max, MLX compiled            | 8.4e-4                          | 127.4 ms  |
+| iPad Pro M5, MLX-Swift eager    | 1.2e-3                          | 209.7 ms  |
+| iPad Pro M5, MLX-Swift compiled | 1.2e-3                          | 156.8 ms  |
 
 The iPad runs the real block at 92% of the Mac's speed (compiled; `compile` is worth 1.34x here)
 in a burst. After ~20-27 s of continuous GPU load it drops to ~0.5-0.6x and stays there (section 5).
