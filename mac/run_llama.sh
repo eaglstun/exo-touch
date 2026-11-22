@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DEVICE="${SPIKE_DEVICE:-00008142-000A05623E47801C}"
+DEVICE="${SPIKE_DEVICE:?set SPIKE_DEVICE to the iPad UDID from xcrun devicectl list devices}"
 MAC_IP="${1:-169.254.147.232}"
 IPAD_IP="${2:-169.254.154.199}"
 PORT="${SPIKE_PORT:-5555}"
@@ -22,7 +22,7 @@ MLX_HOSTFILE="$HOSTFILE" MLX_RANK=0 "$PYTHON" mac/llama_split.py &
 MAC_PID=$!
 sleep 2
 xcrun devicectl device process launch --device "$DEVICE" --terminate-existing --console \
-  --environment-variables "$ENVIRONMENT" com.eaglstun.ExoIPadSpike &
+  --environment-variables "$ENVIRONMENT" "${SPIKE_BUNDLE_ID:-com.eaglstun.ExoIPadSpike}" &
 IPAD_PID=$!
 wait "$MAC_PID"
 wait "$IPAD_PID" || true

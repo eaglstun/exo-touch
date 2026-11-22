@@ -7,9 +7,16 @@ Yes. mlx-swift 0.33.0 pins MLX v0.32.4, the same commit exo runs, so both ranks 
 
     mac/vendor_mlx_swift.sh    # once: patched mlx-swift 0.33.0 into Vendor/ (see "The patched MLX" below)
     xcodegen generate
+    export SPIKE_DEVICE=<ipad udid>    # xcrun devicectl list devices; every mac/*.sh script reads it
     xcodebuild -project ExoIPadSpike.xcodeproj -scheme ExoIPadSpike -configuration Release \
-      -destination 'id=<device udid>' -derivedDataPath build -allowProvisioningUpdates build
-    xcrun devicectl device install app --device <udid> build/Build/Products/Release-iphoneos/ExoIPadSpike.app
+      -destination "id=$SPIKE_DEVICE" -derivedDataPath build -allowProvisioningUpdates build \
+      DEVELOPMENT_TEAM=<your team id>
+    xcrun devicectl device install app --device "$SPIKE_DEVICE" build/Build/Products/Release-iphoneos/ExoIPadSpike.app
+
+Signing needs your own Apple Developer team ID (Xcode > Settings > Accounts, or the Membership
+page at developer.apple.com). A bundle ID is unique to one team, so on any team but the
+original also add `PRODUCT_BUNDLE_IDENTIFIER=<your.prefix>.ExoIPadSpike` to the xcodebuild line,
+and `export SPIKE_BUNDLE_ID=<your.prefix>.ExoIPadSpike` for the `mac/*.sh` scripts.
 
 On the first run, iOS asks for Local Network access. Until you tap Allow, the ring fails with
 `Couldn't connect (error: 60)`.

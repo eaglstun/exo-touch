@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DEVICE="${SPIKE_DEVICE:-00008142-000A05623E47801C}"
+DEVICE="${SPIKE_DEVICE:?set SPIKE_DEVICE to the iPad UDID from xcrun devicectl list devices}"
 MAC_IP="${1:-169.254.147.232}"
 IPAD_IP="${2:-169.254.154.199}"
 PORT="${SPIKE_PORT:-5555}"
@@ -21,7 +21,7 @@ ENVIRONMENT=$(printf '{"SPIKE_RANK":"1","SPIKE_HOSTFILE_JSON":%s}' \
 
 # The iPad streams its stdout here; the Mac rank runs alongside it
 xcrun devicectl device process launch --device "$DEVICE" --terminate-existing --console \
-  --environment-variables "$ENVIRONMENT" com.eaglstun.ExoIPadSpike &
+  --environment-variables "$ENVIRONMENT" "${SPIKE_BUNDLE_ID:-com.eaglstun.ExoIPadSpike}" &
 IPAD_PID=$!
 sleep 3
 MLX_HOSTFILE="$HOSTFILE" MLX_RANK=0 "$PYTHON" mac/mac_rank.py
