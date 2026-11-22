@@ -25,13 +25,31 @@ final class SpikeLog: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var log = SpikeLog()
+    @StateObject private var stats = StatsModel()
 
     var body: some View {
         NavigationStack {
-            List(Array(log.lines.enumerated()), id: \.offset) { _, line in
-                Text(line).font(.system(.body, design: .monospaced))
+            // The stats take the left third in landscape, the bottom third in portrait
+            GeometryReader { geometry in
+                if geometry.size.width > geometry.size.height {
+                    HStack(spacing: 0) {
+                        StatsPanel(model: stats)
+                            .frame(width: geometry.size.width / 3)
+                        Divider()
+                        logList
+                    }
+                } else {
+                    VStack(spacing: 0) {
+                        logList
+                        Divider()
+                        StatsPanel(model: stats)
+                            .frame(height: geometry.size.height / 3)
+                    }
+                }
             }
-            .navigationTitle("MLX ring spike")
+            .onAppear { stats.start() }
+            .navigationTitle("exo touch")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 Button(log.running ? "Running…" : "Run") { start() }
                     .disabled(log.running)
@@ -47,6 +65,21 @@ struct ContentView: View {
         // The ring needs the app in the foreground: keep the screen on while it runs
         .onChange(of: log.running) { _, running in
             UIApplication.shared.isIdleTimerDisabled = running
+        }
+    }
+
+    /// The log, newest line kept in view
+    private var logList: some View {
+        ScrollViewReader { proxy in
+            List(Array(log.lines.enumerated()), id: \.offset) { index, line in
+                Text(line)
+                    .font(.system(.footnote, design: .monospaced))
+                    .id(index)
+            }
+            .listStyle(.plain)
+            .onChange(of: log.lines.count) { _, count in
+                if count > 0 { proxy.scrollTo(count - 1, anchor: .bottom) }
+            }
         }
     }
 

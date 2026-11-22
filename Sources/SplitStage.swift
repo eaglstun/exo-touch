@@ -88,10 +88,26 @@ enum SplitStage {
         }
         guard bound == 0, listen(listener, 1) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         log("split stage listening on port \(port)")
+        Stats.update {
+            $0.mode = "LingBot token split"
+            $0.port = port
+            $0.keepWarm = keepsWarm
+        }
         while true {
             let connection = accept(listener, nil, nil)
             guard connection >= 0 else { continue }
             setsockopt(connection, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
+            let peer = Stats.peerAddress(connection) ?? "Mac"
+            Stats.update {
+                $0.peer = peer
+                $0.connectedAt = Date()
+            }
+            defer {
+                Stats.update {
+                    $0.peer = nil
+                    $0.connectedAt = nil
+                }
+            }
             do {
                 try Session(connection: connection, log: log).run()
             } catch is RemoteStageServer.ConnectionClosed {
@@ -283,6 +299,21 @@ enum SplitStage {
                 log(String(format: "setup: tokens %d..<%d of %d, %d layers, %d cache rows in %.1f s; footprint %.1f GB",
                            start, tokens, tokens, layerCount, cacheRows, Date().timeIntervalSince(started),
                            Double(RemoteStageServer.footprint()) / 1e9))
+                let weightBytes = weights.reduce(0) { $0 + $1.values.reduce(0) { $0 + $1.nbytes } }
+                let cacheBytes = (cacheK + cacheV).reduce(0) { $0 + $1.nbytes }
+                let (layers, rows, share, total) = (layerCount, cacheRows, tokens - start, tokens)
+                Stats.update {
+                    $0.modelName = "LingBot-World DiT"
+                    $0.modelDetail = "FastFrames · bf16 · \(heads) heads × \(headDim)"
+                    $0.layersLoaded = layers
+                    $0.layersExpected = layers
+                    $0.weightBytes = weightBytes
+                    $0.cacheBytes = cacheBytes
+                    $0.cacheRows = rows
+                    $0.shareTokens = share
+                    $0.chunkTokens = total
+                    $0.passes = 0
+                }
                 send(encode(op: "ready", meta: ["footprint": RemoteStageServer.footprint()], arrays: []))
             case "context":
                 if message.layer == 0 {
@@ -538,6 +569,15 @@ enum SplitStage {
                                              "turn_ms": Double(turn) / 1e6],
                         arrays: [("value", value.asType(.float32))]))
             passes += 1
+            let (count, share, total) = (passes, share, tokens)
+            Stats.update {
+                $0.passes = count
+                $0.passMs = ms
+                $0.waitMs = waitMs
+                $0.shareTokens = share
+                $0.chunkTokens = total
+                $0.lastForwardAt = Date()
+            }
             log(String(format: "pass %d: %d tokens x %d rows, %.0f ms (pre %.0f, own rows %.0f, Mac rows %.0f, "
                        + "attention+rest %.0f, waiting %.0f); thermal %@ (pressure %d), CPU probe %.1f ms, %@, "
                        + "footprint %.1f GB",

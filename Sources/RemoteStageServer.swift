@@ -165,17 +165,31 @@ enum RemoteStageServer {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
         log("stage listening on port \(port)")
+        Stats.update {
+            $0.mode = "exo remote stage"
+            $0.port = port
+            $0.keepWarm = ProcessInfo.processInfo.environment["STAGE_KEEP_WARM"] != "0"
+        }
 
         while true {
             let connection = accept(listener, nil, nil)
             guard connection >= 0 else { continue }
             setsockopt(connection, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
+            let peer = Stats.peerAddress(connection) ?? "node"
             Thread {
                 let started = Date()
-                let (forwards, handles) = serveConnection(connection, log: log)
+                let (forwards, handles) = serveConnection(connection, peer: peer, log: log)
                 close(connection)
                 // A memory poll says hello and goes: log only connections that did something
                 if forwards > 0 || handles > 0 {
+                    Stats.update {
+                        if $0.peer == peer {
+                            $0.peer = nil
+                            $0.connectedAt = nil
+                            $0.liveCaches = 0
+                            $0.cacheBytes = 0
+                        }
+                    }
                     log(String(
                         format: "node disconnected after %.1fs: %d forwards, dropped %d caches",
                         Date().timeIntervalSince(started), forwards, handles))
@@ -220,8 +234,10 @@ enum RemoteStageServer {
 
     /// Serves one node until it disconnects. Returns the forwards run and the caches dropped.
     static func serveConnection(
-        _ connection: Int32, log: @escaping (String) -> Void
+        _ connection: Int32, peer: String, log: @escaping (String) -> Void
     ) -> (Int, Int) {
+        // The panel's cache size: summed over every handle's arrays, a few times a second at most
+        var cacheCounted = ContinuousClock.now - .seconds(1)
         var layers: [LlamaShard.Layer] = []
         var ropeFrequencies = MLXArray(0)
         var kvBytesPerToken = 0
@@ -302,6 +318,20 @@ enum RemoteStageServer {
                         arriving = [:]
                         expectedLayers = frame.layerCount
                         loadStarted = Date()
+                        let configDictionary = json as? [String: Any] ?? [:]
+                        Stats.update {
+                            $0.peer = peer
+                            $0.connectedAt = Date()
+                            $0.modelName = Stats.modelName(config: configDictionary)
+                            $0.modelDetail = Stats.modelDetail(config: configDictionary)
+                            $0.layersExpected = frame.layerCount
+                            $0.layersLoaded = 0
+                            $0.weightBytes = 0
+                            $0.forwards = 0
+                            $0.decodeTokens = 0
+                            $0.prefillTokens = 0
+                            $0.lastForwardAt = nil
+                        }
                     }
                     let weights = try loadArrays(data: payload)
                     // Read now, so the frame's bytes can go
@@ -340,6 +370,11 @@ enum RemoteStageServer {
                             format: "loaded %d layers in %.2fs; %.0f MB left to this app",
                             layers.count, Date().timeIntervalSince(loadStarted),
                             Double(os_proc_available_memory()) / 1e6))
+                    }
+                    Stats.update {
+                        $0.layersLoaded = received
+                        $0.weightBytes += payload.count
+                        $0.kvBytesPerToken = layers.isEmpty ? 0 : kvBytesPerToken
                     }
                     try send(Frame(
                         operation: "loaded", layerCount: received,
@@ -481,9 +516,30 @@ enum RemoteStageServer {
                         data)
                     forwards += 1
                     lastForward = ContinuousClock.now
+                    // [batch, tokens, hidden]: one token per sequence is decode, more is prefill
+                    let batch = frame.shape.first ?? 1
+                    let length = frame.shape.count == 3 ? frame.shape[1] : 1
+                    let took = lastForward - built
+                    let forwardMs = Double(took.components.seconds) * 1e3 + Double(took.components.attoseconds) / 1e15
+                    var counted: Int?
+                    if lastForward - cacheCounted > .milliseconds(250) {
+                        counted = Stats.cacheBytes(caches)
+                        cacheCounted = lastForward
+                    }
+                    Stats.update {
+                        $0.forwards += 1
+                        if length == 1 { $0.decodeTokens += batch } else { $0.prefillTokens += batch * length }
+                        $0.lastForwardMs = forwardMs
+                        $0.lastForwardAt = Date()
+                        if let counted { $0.cacheBytes = counted }
+                    }
                 default:
                     try send(Frame(operation: "error", message: "a node doesn't send \(frame.operation)"))
                     return (forwards, caches.count)
+                }
+                if !layers.isEmpty {
+                    let live = caches.count
+                    Stats.update { if $0.peer == peer { $0.liveCaches = live } }
                 }
             }
         } catch {
@@ -510,6 +566,7 @@ enum RemoteStageServer {
             if result <= 0 { throw ConnectionClosed() }
             received += result
         }
+        Stats.update { $0.bytesIn += count }
         return data
     }
 
@@ -522,5 +579,6 @@ enum RemoteStageServer {
             if result <= 0 { throw ConnectionClosed() }
             sent += result
         }
+        Stats.update { $0.bytesOut += data.count }
     }
 }
